@@ -34,11 +34,6 @@ rapids_cpm_init()
 include(cmake/thirdparty/get_raft.cmake)
 
 # -------------- compile tasks ----------------- #
-# add_executable(CAGRA_EXAMPLE src/cagra_example.cu)
-# target_link_libraries(CAGRA_EXAMPLE PRIVATE raft::raft raft::compiled)
-
-# add_executable(IVF_FLAT_EXAMPLE src/ivf_flat_example.cu)
-# target_link_libraries(IVF_FLAT_EXAMPLE PRIVATE raft::raft raft::compiled)
 add_library(easylogging src/easylogging++.cc)
 target_compile_definitions(easylogging PUBLIC ELPP_THREAD_SAFE)
 

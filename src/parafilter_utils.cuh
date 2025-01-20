@@ -64,6 +64,7 @@ struct parafilter_config {
   uint64_t enable_multi_gpu;
   uint64_t mem_bound;
   uint64_t is_calc_mem_predictor_coeff;
+  float merge_rate;
 
   std::string dataset;
   std::string path;
@@ -100,8 +101,14 @@ struct parafilter_config {
         }
       }
       if (quotesStart == std::string::npos) {
-        *(static_cast<uint64_t *>((static_cast<void*>(this) + str_to_offset_map[currConfigStr])))
+        if (isInteger(currValue)) {
+          *(static_cast<uint64_t *>((static_cast<void*>(this) + str_to_offset_map[currConfigStr])))
                                                          = (uint64_t)(std::atoll(currValue.c_str()));
+        }
+        else {
+          *(static_cast<float *>((static_cast<void*>(this) + str_to_offset_map[currConfigStr])))
+                                                         = (float)(std::stof(currValue.c_str()));
+        }
       }
       else {
         *(static_cast<std::string *>((static_cast<void*>(this) +  str_to_offset_map[currConfigStr])))
@@ -139,6 +146,22 @@ struct parafilter_config {
   }
   std::string& trim(std::string& str) {
     return ltrim(rtrim(str));
+  }
+
+  bool isInteger(const std::string& str) {
+    if (str.empty()) return false;
+
+    size_t i = 0;
+    if (str[i] == '+' || str[i] == '-') {
+        i++;
+    }
+
+    for (; i < str.size(); i++) {
+        if (!isdigit(str[i])) {
+            return false;
+        }
+    }
+    return i > 0;
   }
 
   /*initialize string to offset data in class static function*/
@@ -795,4 +818,5 @@ std::map<std::string, int> parafilter_config::str_to_offset_map = { \
       {"ENABLE_MULTI_GPU", offsetof(parafilter_config, enable_multi_gpu)}, \
       {"MEM_BOUND", offsetof(parafilter_config, mem_bound)}, \
       {"IS_CALC_MEM_PREDICTOR_COEFF", offsetof(parafilter_config, is_calc_mem_predictor_coeff)}, \
+      {"MERGE_RATE", offsetof(parafilter_config, merge_rate)}, \
 };

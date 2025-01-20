@@ -116,7 +116,8 @@ void parafilter_query(raft::device_resources const& dev_resources,
                       uint32_t* exps,
                       int pq_dim, 
                       int pq_len, 
-                      int topk) 
+                      int topk, 
+                      float merge_rate) 
 {    
   int n_data = dataset.extent(0);
   int n_queries = queries.extent(0);
@@ -138,16 +139,17 @@ void parafilter_query(raft::device_resources const& dev_resources,
   auto label_dis_ptr = label_dis.data_handle();
   // sum distance of vectors and lebels
   auto dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, n_data);
-  matrix_add_with_weights<float, uint64_t>(dev_resources, vec_dis, label_dis, dis, 1.f, 0.035f);
+  matrix_add_with_weights<float, uint64_t>(dev_resources, vec_dis, label_dis, dis, 1.f, merge_rate);
   
   auto first_candi_labels = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, topk * exps[0] * l);
   auto first_val = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, topk * exps[0]);
   auto first_idx = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk * exps[0]);
 
-  raft::matrix::select_k<float, uint64_t>(dev_resources, dis, std::nullopt, first_val, first_idx, true);
+  raft::matrix::select_k<float, uint64_t>(dev_resources, dis, std::nullopt, first_val, first_idx, true, true);
   select_elements<float, uint64_t>(dev_resources, data_labels, first_idx, first_candi_labels);
   cudaDeviceSynchronize();
   auto first_idx_ptr = first_idx.data_handle();
+  auto first_val_ptr = first_val.data_handle();
 
   auto second_indices = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk * exps[1]);
   filter_candi_by_labels(dev_resources, first_candi_labels, ranges, first_val, topk * exps[1], second_indices);
@@ -203,6 +205,7 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                           int topk,
                           float global_min,
                           float global_max,
+                          float merge_rate = 0.035, 
                           bool run_build = true) 
 {
     size_t n_data = dataset.extent(0);
@@ -261,7 +264,8 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                      exps, 
                      pq_dim, 
                      pq_len, 
-                     topk
+                     topk, 
+                     merge_rate
                   ), 
                      query_time
     );
@@ -396,9 +400,6 @@ void split_task(double* coeff,
     uint64_t r_q = n_queries;
     uint64_t l_q = 0;
 
-    uint32_t total_threads = get_cur_device_maxi_threads();
-    uint32_t min_threads_cnt = total_threads * 4;
-
     while (1) {
       uint64_t mid_d = (r_d + l_d + 1) >> 1;
 
@@ -425,6 +426,7 @@ void split_task(double* coeff,
   };
   // todo: when cannot find proper batch size for current upper bound, enlarge it
   bisearch_proper_split(upper_bound);
+  while (n_queries % query_batch_size != 0) query_batch_size--;
 }
 
 void calculate_batch_min_max(const std::string& path, float& global_min, float& global_max, 
@@ -657,11 +659,6 @@ bool read_coeff_from_binary(const std::string& file_path, double coeff[4]) {
 
 int main()
 {
-  raft::device_resources dev_resources;
-
-  rmm::mr::pool_memory_resource<rmm::mr::device_memory_resource> pool_mr(
-  rmm::mr::get_current_device_resource(), 1 * 1024 * 1024 * 1024ull);
-  rmm::mr::set_current_device_resource(&pool_mr);
   parafilter_mmr::init_mmr();
 
   parafilter_config *p_config = nullptr;
@@ -691,9 +688,15 @@ int main()
   exps[0] = p_config->exp1;
   exps[1] = p_config->exp2;
   uint32_t topk = p_config->topk;
+  float merge_rate = p_config->merge_rate;
 
   double coeff[4];
   if (p_config->is_calc_mem_predictor_coeff) {
+    raft::device_resources dev_resources;
+    rmm::mr::pool_memory_resource<rmm::mr::device_memory_resource> pool_mr(
+    rmm::mr::get_current_device_resource(), 1 * 1024 * 1024 * 1024ull);
+    rmm::mr::set_current_device_resource(&pool_mr);
+    
     calc_mem_predictor_coeff(dev_resources, pq_dim, n_dim, l, tot_samples, 
             tot_queries, n_clusters, exps, topk, coeff);
     write_coeff_to_binary("coeff", coeff);
@@ -710,6 +713,13 @@ int main()
 
   auto per_device_worker = [&](uint32_t i) {
     cudaSetDevice(i);
+
+    // fixme: avoid to use raft mem pool
+    raft::device_resources dev_resources;
+    rmm::mr::pool_memory_resource<rmm::mr::device_memory_resource> pool_mr(
+    rmm::mr::get_current_device_resource(), 1 * 1024 * 1024 * 1024ull);
+    rmm::mr::set_current_device_resource(&pool_mr);
+
     uint64_t query_offset, n_queries;
     split_uniform(tot_queries, device_count, i, n_queries, query_offset);
     uint64_t query_batch_size, data_batch_size;
@@ -767,7 +777,7 @@ int main()
         bool run_build = query_batch_offset == 0 ? true : false;
         parafilter_build_run(dev_resources, queries, dataset,  
                           data_labels, query_labels, selected_distance, selected_indices,
-                          pq_dim, n_clusters, exps, topk, global_min, global_max, run_build);
+                          pq_dim, n_clusters, exps, topk, global_min, global_max, merge_rate, run_build);
 
         cudaEventRecord(compute_done_event[cur_res_buff_offset]);  
         flush_current_res(selected_distance.data_handle(), selected_indices.data_handle(), inter_buffer_size, 
@@ -780,7 +790,7 @@ int main()
       }
     }
     cudaDeviceSynchronize();
-    LOG(INFO) << "device: " << i << "build time:" << build_time << "query time:" << query_time;
+    LOG(INFO) << "device: " << i << "build time:" << build_time << ", query time:" << query_time;
     parafilter_mmr::free_cur_workspace_device_mems();
     flush_current_res((float*)0, (uint64_t*)0, 0, dis_copy_done_event[0], idx_copy_done_event[0], compute_done_event[0], 
                       i, "./res/", true);

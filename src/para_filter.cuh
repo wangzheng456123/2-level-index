@@ -336,11 +336,12 @@ inline void filter_candi_by_labels(raft::device_resources const& dev_resources,
 
     auto select_val = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_constrains, topk);
 
-    raft::matrix::select_k<float, uint64_t>(dev_resources, pq_dis, std::nullopt, select_val, fcandi, true);
+    raft::matrix::select_k<float, uint64_t>(dev_resources, pq_dis, std::nullopt, select_val, fcandi, true, true);
     full_blocks_per_grid.y = (topk + block_size_y - 1) / block_size_y;
     process_selected_indices_kernel<<<full_blocks_per_grid, full_thread_per_grid>>>(select_val.data_handle(), fcandi.data_handle(), 
         n_constrains, topk);
     
+    auto selected_val = select_val.data_handle();
     return ;
 }
 
@@ -463,7 +464,7 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
                                  bool is_query_changed = true,
                                  bool is_data_changed = true, 
                                  ElementType left = 0, 
-                                 ElementType right = 0) 
+                                 ElementType right = 3 * 24 * 3600) 
 {
     IndexType n_data = normalized_data_labels.extent(0);
     IndexType n_queries = normalized_query_labels.extent(0);
@@ -475,7 +476,7 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
 
     float coeff = 1;
     if (left + right != 0) 
-        float coeff = 2.0 / (left + right);
+        coeff = 2.0 / (left + right);
     float shift_val = right - left;
 
     // todo fuse the 3 kernel calls to 1
