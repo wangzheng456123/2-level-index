@@ -1,0 +1,710 @@
+#pragma once
+
+#include "parafilter_utils.cuh"
+
+#include <raft/core/device_mdarray.hpp>
+#include <raft/core/device_resources.hpp>
+#include <raft/matrix/select_k.cuh>
+#include <assert.h>
+#include <cmath>
+
+const int block_size = 128;
+const int block_size_x = 32;
+const int block_size_y = 16;
+
+INIT_PARAFILTER
+
+template<typename ElmentType, typename IndexType>
+__global__ void min_max_reduce_kernel(ElmentType *input, ElmentType* output, IndexType n, bool is_min = true)
+{
+    IndexType block_size = blockDim.x;
+    IndexType thread_id = threadIdx.x;
+    IndexType block_id = blockIdx.x;
+
+    IndexType chunk_size = block_size * 2;
+    IndexType block_start = block_id * chunk_size;
+    IndexType left;  // holds index of left operand
+    IndexType right; // holds index or right operand
+    IndexType threads = block_size;
+    for (IndexType stride = 1; stride < chunk_size; stride *= 2, threads /= 2)
+    {
+        left = block_start + thread_id * (stride * 2);
+        right = left + stride;
+
+        if (thread_id < threads 
+            && right < n) 
+        {
+            if (is_min)
+                input[left] = std::min(input[right], input[left]);
+            else input[left] = std::max(input[right], input[left]);
+        }
+        __syncthreads();
+    }
+
+    if (!thread_id)
+    {
+        output[block_id] = input[block_start];
+    }
+}
+
+template <typename m_t, typename idx_t = int>
+RAFT_KERNEL slice(const m_t* src_d, idx_t lda, m_t* dst_d, idx_t x1, idx_t y1, idx_t x2, idx_t y2)
+{
+  idx_t idx = threadIdx.x + blockDim.x * blockIdx.x;
+  idx_t dm = x2 - x1, dn = y2 - y1;
+  if (idx < dm * dn) {
+    idx_t i = idx % dm, j = idx / dm;
+    idx_t is = i + x1, js = j + y1;
+    dst_d[idx] = src_d[is + js * lda];
+  }
+}
+
+template <typename idx_t>
+struct slice_coordinates {
+  idx_t row1;  ///< row coordinate of the top-left point of the wanted area (0-based)
+  idx_t col1;  ///< column coordinate of the top-left point of the wanted area (0-based)
+  idx_t row2;  ///< row coordinate of the bottom-right point of the wanted area (1-based)
+  idx_t col2;  ///< column coordinate of the bottom-right point of the wanted area (1-based)
+
+  slice_coordinates(idx_t row1_, idx_t col1_, idx_t row2_, idx_t col2_)
+    : row1(row1_), col1(col1_), row2(row2_), col2(col2_)
+  {
+  }
+};
+
+/*for the value in dis, if it pass the filter constrains, save its value, otherwise drop it*/
+__global__ void filter_by_constrain_kernel(float* dis, const float* constrains, 
+                                            const float* candi_label, int l, int n_queries, int n_candi) 
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= n_queries || y >= n_candi) return ;
+    int ans = 1;
+
+    for (int i = 0; i < l; i++) {
+        float li = constrains[x * l * 2 + i * 2];
+        float ri = constrains[x * l * 2 + i * 2 + 1];
+
+        float label = candi_label[x * l * n_candi + y * l + i];
+
+        if (label < li || label > ri) {
+            ans = 0;
+            break;
+        }
+    }
+
+    int idx = x * n_candi + y;
+    if (ans == 0) dis[idx] = std::numeric_limits<float>::max(); 
+}
+
+// fixme: this kernel currently unused, but it may useful future because its satisify pseudocode in paper
+__global__ void normalize_constrains_kernel(const float* constrains, int l, int n_cons, float* res) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    if (x >= n_cons) return ;
+
+    for (int i = 0; i < l; i++) {
+        float li = constrains[l * x * 2 + 2 * i + 0];
+        float ri = constrains[l * x * 2 + 2 * i + 1];
+
+        float len = std::max(static_cast<double>(ri - li), 1e-5);
+        res[l * x + i] = (li + ri) / 
+                            len;
+    }
+}
+
+// todo: per elements processing kernel can be implement with device lamda.
+// use none-const labels to enable on-site process
+__global__ void normalize_labels_kernel(float* data_labels, float* normalized_data_labels, 
+    uint64_t n_data, float coeff, float data_shift, float global_min, float global_max) 
+{
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x; 
+    if (tid >= n_data) return;
+    normalized_data_labels[tid] = (data_labels[tid] - data_shift - global_min) * coeff;
+}
+
+__global__ void denormalize_labels_kernel(const float* data, uint64_t n_data, 
+    float data_shift, float *out) 
+{
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x; 
+    if (tid >= n_data) return;
+    out[tid * 2] = data[tid] - data_shift;
+    out[tid * 2 + 1] = data[tid];
+}
+
+template <typename ElementType, typename IndexType>
+__global__ void build_pq_lut_kernel(
+    const ElementType* centers, const ElementType* queries,
+    IndexType query_batch_size, ElementType* lut,
+    IndexType pq_len, IndexType pq_dim, IndexType n_dim,
+    IndexType n_queries, IndexType n_clusters)
+{
+    IndexType query_batch_id = blockIdx.x * blockDim.x + threadIdx.x;
+    IndexType cluster_id = blockIdx.y * blockDim.y + threadIdx.y;
+    IndexType cur_dim = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (cluster_id >= n_clusters || cur_dim >= pq_dim) return;
+
+    for (IndexType i = 0; i < query_batch_size; i++) {
+        IndexType qid = query_batch_id * query_batch_size + i;
+        if (qid >= n_queries) return;
+
+        IndexType lut_index = qid * pq_dim * n_clusters + cur_dim * n_clusters + cluster_id;
+        ElementType ans = 0;
+
+        for (IndexType d = 0; d < pq_len; d++) {
+            IndexType query_index = qid * n_dim + cur_dim * pq_len + d;
+            IndexType center_index = cur_dim * pq_len * n_clusters + cluster_id * pq_len + d;
+
+            if (cur_dim * pq_len + d >= n_dim) break;
+
+            ans += (centers[center_index] - queries[query_index]) *
+                 (centers[center_index] - queries[query_index]);
+        }
+
+        lut[lut_index] = ans;
+    }
+}
+
+template <typename CodebookType, typename ElementType, typename IndexType>
+__global__ void compute_batched_L2_distance_kernel(
+    const CodebookType* codebook,   // Codebook: n_data * pq_dim, column-major
+    const ElementType* lut,        // LUT: n_queries * pq_dim * n_clusters
+    ElementType* result,           // Output: n_queries * n_data
+    IndexType n_data,              // Number of data points
+    IndexType pq_dim,              // Number of dimensions
+    IndexType n_clusters,          // Number of clusters
+    IndexType n_queries,           // Number of queries
+    IndexType data_batch_size,     // Batch size for data
+    IndexType query_batch_size)    // Batch size for queries
+{
+    // Thread's starting position
+    IndexType query_start = blockIdx.y * blockDim.y * query_batch_size + threadIdx.y * query_batch_size;
+    IndexType data_start = blockIdx.x * blockDim.x * data_batch_size + threadIdx.x * data_batch_size;
+
+    // Temporary sum storage for batch
+    for (IndexType q = 0; q < query_batch_size && query_start + q < n_queries; q++) {
+        for (IndexType d = 0; d < data_batch_size && data_start + d < n_data; d++) {
+            ElementType sum = static_cast<ElementType>(0);
+
+            for (IndexType dim = 0; dim < pq_dim; dim++) {
+                CodebookType lut_idx = codebook[dim * n_data + data_start + d];  // Column-major access
+                sum += lut[(query_start + q) * pq_dim * n_clusters + dim * n_clusters + lut_idx];
+            }
+
+            result[(query_start + q) * n_data + data_start + d] = sum;
+        }
+    }
+}
+
+template <typename T, typename IndexType>
+__global__ void transpose_kernel(const T* __restrict__ input, T* __restrict__ output,
+                                  IndexType rows, IndexType cols) {
+    __shared__ T tile[32][32 + 1]; // +1 to avoid bank conflicts
+
+    // Thread and block indices
+    IndexType x = blockIdx.x * blockDim.x + threadIdx.x;
+    IndexType y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Local indices in the shared memory
+    IndexType local_x = threadIdx.x;
+    IndexType local_y = threadIdx.y;
+
+    // Read data from global memory to shared memory
+    if (x < cols && y < rows) {
+        tile[local_y][local_x] = input[y * cols + x];
+    }
+    __syncthreads();
+
+    // Transpose the tile and write it back to global memory
+    x = blockIdx.y * blockDim.y + threadIdx.x; // Transposed position
+    y = blockIdx.x * blockDim.x + threadIdx.y;
+
+    if (x < rows && y < cols) {
+        output[y * rows + x] = tile[local_x][local_y];
+    }
+}
+
+// select a batch of idices of row from the input matrix
+template<typename ElementType, typename IndexType>
+__global__ void select_elements_kernel(const ElementType* input, const IndexType* indices, 
+                                        ElementType *output, IndexType n_row_o, IndexType n_row_i, 
+                                        IndexType n_dim_o, IndexType n_dim_i, bool is_select_row) 
+{
+    IndexType x = blockIdx.x * blockDim.x + threadIdx.x;
+    IndexType y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= n_row_o || y >= n_dim_o) return ;
+    IndexType idx = x;
+    IndexType idy = indices[x * n_dim_o + y]; 
+    ElementType max_value = std::numeric_limits<ElementType>::max();
+
+    if (is_select_row) {
+        for (IndexType i = 0; i < n_dim_i; i++) {
+            IndexType o_idx = x * n_dim_i * n_dim_o + y * n_dim_i + i;
+            if (idy < n_row_i) 
+                output[o_idx] = input[n_dim_i * idy + i];
+            else output[o_idx] = std::sqrt(max_value / static_cast<ElementType>(n_dim_i));
+        }
+    }
+    else {
+        IndexType o_idx = x * n_dim_o + y;
+        if (idy < n_dim_i)
+            output[o_idx] = input[n_dim_i * idx + idy];
+        else output[o_idx] = max_value;
+    }
+}
+
+// add C = w1 * A + w2 * B with matrix A, B, C
+template<typename ElementType, typename IndexType>
+__global__ void matrix_weight_add_kernel(const ElementType *A, const ElementType *B, ElementType *C,
+                                       IndexType n_row, IndexType n_dim, ElementType w1, ElementType w2) 
+{
+    IndexType x = blockDim.x * blockIdx.x + threadIdx.x;
+    IndexType y = blockDim.y * blockIdx.y + threadIdx.y;
+
+    if (x >= n_row || y >= n_dim) return ;
+
+    IndexType idx = x * n_dim + y;
+    C[idx] = w1 * A[idx] + w2 * B[idx]; 
+} 
+
+template<typename ElementType, typename IndexType>
+__device__ ElementType calc_vector_L2_dis_device(const ElementType *v1, const ElementType *v2, IndexType n_dim)
+{
+    ElementType ans = 0;
+    for (IndexType i = 0; i < n_dim; i++) {
+        ans += pow(v1[i] - v2[i], 2);
+    }
+
+    return ans;
+}
+
+template<typename ElementType, typename IndexType>
+__global__ void calc_refine_distance_kernel(const ElementType *candi_vec, const ElementType *queries, IndexType n_dim, 
+                                            IndexType n_queries, IndexType n_candi, ElementType* dis) 
+{
+    IndexType x = blockDim.x * blockIdx.x + threadIdx.x;
+    IndexType y = blockDim.y * blockIdx.y + threadIdx.y;
+
+    if (x >= n_queries || y >= n_candi) return;
+
+    IndexType candi_idx = x * n_candi * n_dim + y * n_dim;
+    IndexType query_idx = x * n_dim;   
+    IndexType o_idx = x * n_candi + y;
+
+    dis[o_idx] = calc_vector_L2_dis_device(candi_vec + candi_idx, queries + query_idx, n_dim);
+}
+
+template <typename ElementType, typename IndexType>
+__global__ void process_selected_indices_kernel(const ElementType* pq_dis, IndexType* SelectedIndices, 
+                                                IndexType n_queries, int n_candies) 
+{
+    IndexType i = blockIdx.x * blockDim.x + threadIdx.x; 
+    IndexType j = blockIdx.y * blockDim.y + threadIdx.y; 
+
+    if (i >= n_queries || j >= n_candies) return;
+
+    IndexType idx = i * n_candies + j;
+    ElementType value = pq_dis[idx];
+
+    if (value == std::numeric_limits<ElementType>::max()) {
+        SelectedIndices[idx] = std::numeric_limits<IndexType>::max();
+    }
+}
+
+inline void filter_candi_by_labels(raft::device_resources const& dev_resources,
+                                   raft::device_matrix_view<float, uint64_t> const& candi_labels, 
+                                   raft::device_matrix_view<float, uint64_t> const& constrains, 
+                                   raft::device_matrix_view<float, uint64_t> const& pq_dis,
+                                   int topk, 
+                                   raft::device_matrix_view<uint64_t, uint64_t> fcandi) 
+{
+    uint64_t n_constrains = constrains.extent(0);
+    uint64_t l = constrains.extent(1) / 2;
+    uint64_t n_candi = candi_labels.extent(1) / l;
+    
+    int full_block_per_grid_x = (n_constrains + block_size_x - 1) / block_size_x;
+    int full_block_per_grid_y = (n_candi + block_size_y - 1) / block_size_y;
+
+    dim3 full_blocks_per_grid(full_block_per_grid_x, full_block_per_grid_y);
+    dim3 full_thread_per_grid(block_size_x, block_size_y);
+
+    filter_by_constrain_kernel<<<full_blocks_per_grid, full_thread_per_grid>>>(pq_dis.data_handle(), constrains.data_handle(), 
+        candi_labels.data_handle(), l, n_constrains, n_candi
+    );
+
+    auto select_val = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_constrains, topk);
+
+    raft::matrix::select_k<float, uint64_t>(dev_resources, pq_dis, std::nullopt, select_val, fcandi, true);
+    full_blocks_per_grid.y = (topk + block_size_y - 1) / block_size_y;
+    process_selected_indices_kernel<<<full_blocks_per_grid, full_thread_per_grid>>>(select_val.data_handle(), fcandi.data_handle(), 
+        n_constrains, topk);
+    
+    return ;
+}
+
+template<typename IndexType> 
+__global__ void modify_data_patch_offset_kernel(IndexType* indices, 
+                                     IndexType last_offset, 
+                                     IndexType stride, 
+                                     IndexType n_row, 
+                                     IndexType n_dim, 
+                                     IndexType topk) 
+{
+    IndexType x = blockIdx.x * blockDim.x + threadIdx.x;
+    IndexType y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= n_row || y >= n_dim) return;
+
+    IndexType batch_cnt = n_dim / topk;
+    IndexType batch_id = y / topk;
+
+    IndexType id = x * n_dim + y;
+    
+    indices[id] += last_offset - (batch_cnt - batch_id - 1) * stride;
+} 
+
+template <typename ElementType, typename IndexType>
+__global__ void modify_blocks(ElementType* d_matrix, IndexType n_queries, int topk, IndexType batch_size, 
+                              ElementType start, IndexType data_batch_size) 
+{
+    IndexType row = blockIdx.y * blockDim.y + threadIdx.y; 
+    IndexType block_idx = blockIdx.x * blockDim.x + threadIdx.x; 
+
+    if (row < n_queries && block_idx < batch_size) {
+        IndexType block_start = row * (batch_size * topk) + block_idx * topk;
+        ElementType add_value = start + block_idx * data_batch_size;
+
+        for (IndexType i = 0; i < topk; ++i) {
+            d_matrix[block_start + i] += add_value;
+        }
+    }
+}
+
+template <typename T, typename IndexType>
+void transpose_matrix(const T* input, T* output, IndexType rows, IndexType cols) {
+    // Define block and grid sizes
+    if (cols == 1)  {
+        cudaMemcpy(output, input, rows * cols * sizeof(T), cudaMemcpyDeviceToDevice);
+        return ;
+    }
+    const int TILE_DIM = 32;
+    dim3 blockDim(TILE_DIM, TILE_DIM);
+    dim3 gridDim((cols + TILE_DIM - 1) / TILE_DIM, (rows + TILE_DIM - 1) / TILE_DIM);
+
+    // Launch the kernel
+    transpose_kernel<T, IndexType><<<gridDim, blockDim>>>(input, output, rows, cols);
+
+    // Synchronize the stream (optional, for error checking)
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA kernel launch error: " << cudaGetErrorString(err) << std::endl;
+    }
+}
+
+template <typename ElementType, typename IndexType>
+inline ElementType array_min_max_reduce(ElementType* in_array_device,
+    IndexType n_elements,
+    bool is_min = true) {
+    // Constants
+    constexpr IndexType block_size = 256; // Adjust based on GPU architecture
+    IndexType threads_cnt = n_elements;
+
+    // Compute initial number of blocks
+    IndexType block_cnt = (threads_cnt + 2 * block_size - 1) / (2 * block_size);
+    IndexType remaining = n_elements;
+
+    // Allocate temporary memory on the device
+    ElementType* sums_device = nullptr;
+    cudaMalloc(&sums_device, block_cnt * sizeof(ElementType));
+    ElementType* in_array_temp = nullptr;
+    cudaMalloc(&in_array_temp, n_elements * sizeof(ElementType));
+
+    // Copy the input array to temporary memory
+    cudaMemcpy(in_array_temp, in_array_device, n_elements * sizeof(ElementType), cudaMemcpyDeviceToDevice);
+
+    ElementType final_result;
+
+    // Iterative reduction
+    while (remaining > 1) {
+        // Launch reduction kernel
+        min_max_reduce_kernel << <block_cnt, block_size >> > (in_array_temp, sums_device, remaining, is_min);
+        cudaDeviceSynchronize();
+
+        // Update remaining elements and block count
+        remaining = block_cnt;
+        block_cnt = (remaining + 2 * block_size - 1) / (2 * block_size);
+
+        // Swap input and output arrays for the next iteration if needed
+        if (remaining > 1) {
+            std::swap(in_array_temp, sums_device);
+        }
+    }
+
+    // Copy the final result back to the host
+    cudaMemcpy(&final_result, sums_device, sizeof(ElementType), cudaMemcpyDeviceToHost);
+
+    // Free allocated device memory
+    cudaFree(sums_device);
+    cudaFree(in_array_temp);
+
+    return final_result;
+}
+
+template<typename ElementType, typename IndexType>
+inline void preprocessing_labels(raft::device_resources const& dev_resources,
+                                 raft::device_matrix_view<ElementType, IndexType> data_labels, 
+                                 raft::device_matrix_view<ElementType, IndexType> normalized_data_labels,
+                                 raft::device_matrix_view<ElementType, IndexType> query_labels, 
+                                 raft::device_matrix_view<ElementType, IndexType> normalized_query_labels,
+                                 raft::device_matrix_view<ElementType, IndexType> denormalized_query_labels,
+                                 ElementType global_min, 
+                                 ElementType global_max, 
+                                 bool is_query_changed = true,
+                                 bool is_data_changed = true, 
+                                 ElementType left = 0, 
+                                 ElementType right = 0) 
+{
+    IndexType n_data = normalized_data_labels.extent(0);
+    IndexType n_queries = normalized_query_labels.extent(0);
+
+    IndexType l_dim = normalized_data_labels.extent(1);
+
+    int full_block_per_grid_x = (n_data + block_size - 1) / block_size;
+    dim3 full_block_per_grid(full_block_per_grid_x);
+
+    float coeff = 1;
+    if (left + right != 0) 
+        float coeff = 2.0 / (left + right);
+    float shift_val = right - left;
+
+    // todo fuse the 3 kernel calls to 1
+    if (is_data_changed) {
+        normalize_labels_kernel<<<full_block_per_grid, block_size>>>(data_labels.data_handle(), 
+        normalized_data_labels.data_handle(), n_data, coeff, 0, global_min, global_max);
+    }
+
+    if (is_query_changed) {
+        full_block_per_grid.x = (n_queries + block_size - 1) / block_size;
+        denormalize_labels_kernel<<<full_block_per_grid, block_size>>>(query_labels.data_handle(), 
+            n_queries, shift_val, denormalized_query_labels.data_handle());
+
+        normalize_labels_kernel<<<full_block_per_grid, block_size>>>(query_labels.data_handle(),  
+            normalized_query_labels.data_handle(), n_queries, coeff, shift_val, global_min, global_max);
+    }
+}
+
+// calculate similarity between batched datas and queries
+// here, codebook is row major with dim pq_dim * N, and centers is a matrix with (pq_len * N) * pq_dim matrix
+// todo: modify it to template
+inline void calc_batched_L2_distance(raft::device_resources const& dev_resources,
+                                     raft::device_matrix_view<float, uint64_t> const& queries, 
+                                     raft::device_matrix_view<uint8_t, uint64_t> const& codebook,
+                                     raft::device_matrix_view<float, uint64_t> const& centers, 
+                                     raft::device_matrix_view<float, uint64_t> dis,
+                                     uint64_t pq_dim,  
+                                     uint64_t pq_len,
+                                     uint64_t query_batch_size = 1, 
+                                     uint64_t data_batch_size = 1, 
+                                     uint64_t n_clusters = 256) 
+{
+    uint64_t n_dim = queries.extent(1);
+    uint64_t n_data = codebook.extent(1);
+    uint64_t n_queries = queries.extent(0);
+
+    std::cout << "calc vector similarity: with data size: " << n_data 
+                    << ", query cnt: " << n_queries << ", pq dimension: " << pq_dim << "\n";
+
+    // int one cuda thread, process a batched of queries and data vectors
+    uint64_t data_batch_cnt = (n_data + data_batch_size - 1) / data_batch_size;
+    uint64_t query_batch_cnt = (n_queries + query_batch_size - 1)  / query_batch_size;
+
+    float* lut;
+    uint64_t lut_size = n_queries * pq_dim * n_clusters * sizeof(float);
+    lut = (float *)parafilter_mmr::mem_allocator(lut_size);
+
+    int lut_block_dim_z = pq_dim;
+    int lut_block_dim_x = (n_queries + block_size_x - 1) / block_size_x;
+    int lut_block_dim_y = (n_clusters + block_size_y - 1) / block_size_y;
+
+    dim3 lut_full_blocks_per_grid(lut_block_dim_x, lut_block_dim_y, lut_block_dim_z);
+    dim3 lut_full_threads_per_grid(block_size_x, block_size_y, 1);
+
+    build_pq_lut_kernel<<<lut_full_blocks_per_grid, lut_full_threads_per_grid>>>(
+        centers.data_handle(), queries.data_handle(), query_batch_size, lut, pq_len, pq_dim, n_dim, n_queries, n_clusters
+    );
+    checkCUDAErrorWithLine("launch lut build kernel failed!");
+
+    uint64_t block_dim_x = (data_batch_cnt + block_size_x - 1) / block_size_x;
+    uint64_t block_dim_y = (query_batch_cnt + block_size_y - 1) / block_size_y;
+
+    dim3 full_blocks_per_grid(block_dim_x, block_dim_y);
+    dim3 full_threads_per_block(block_size_x, block_size_y);
+
+    compute_batched_L2_distance_kernel<<<full_blocks_per_grid, full_threads_per_block>>>(
+        codebook.data_handle(), lut, dis.data_handle(), n_data, pq_dim, n_clusters, n_queries, data_batch_size, query_batch_size
+    );
+    checkCUDAErrorWithLine("launch pq similarity calculation kernel failed!");
+} 
+
+// select elements of in an indices set from the input matrix and put it into the output matrix
+template<typename ElementType, typename IndexType>
+inline void select_elements(raft::device_resources const& dev_resources,
+                            raft::device_matrix_view<ElementType, IndexType> const& input_matrix,
+                            raft::device_matrix_view<IndexType, IndexType> const& indices, 
+                            raft::device_matrix_view<ElementType, IndexType> output,
+                            bool is_select_row = true) 
+{
+    IndexType n_row_o = indices.extent(0);
+    IndexType n_row_i = input_matrix.extent(0);
+    
+    IndexType n_dim_i = input_matrix.extent(1);
+    IndexType n_dim_o = indices.extent(1); 
+
+    int full_block_per_grid_x = (n_row_o + block_size_x - 1) / block_size_x;
+    int full_block_per_grid_y = (n_dim_o + block_size_y - 1) / block_size_y;
+
+    dim3 full_blocks_per_grid(full_block_per_grid_x, full_block_per_grid_y);
+    dim3 full_threads_per_block(block_size_x, block_size_y);
+
+    select_elements_kernel<<<full_blocks_per_grid, full_threads_per_block>>>(input_matrix.data_handle(), 
+            indices.data_handle(), output.data_handle(), n_row_o, n_row_i, n_dim_o, n_dim_i, is_select_row);
+
+}
+
+template<typename ElementType, typename IndexType>
+inline void matrix_add_with_weights(raft::device_resources const& dev_resources,
+                                    raft::device_matrix_view<ElementType, IndexType> const& A,
+                                    raft::device_matrix_view<ElementType, IndexType> const& B,
+                                    raft::device_matrix_view<ElementType, IndexType> C,
+                                    ElementType w1, 
+                                    ElementType w2) 
+{
+    IndexType n_row_a = A.extent(0);
+    IndexType n_dim_a = A.extent(1);
+
+    IndexType n_row_b = B.extent(0);
+    IndexType n_dim_b = B.extent(1);
+
+    assert(n_row_a == n_row_b && n_dim_a == n_dim_b);
+
+    int block_dim_x = (n_row_a + block_size_x - 1) / block_size_x;
+    int block_dim_y = (n_dim_a + block_size_y - 1) / block_size_y;
+
+    dim3 full_blocks_per_grid(block_dim_x, block_dim_y);
+    dim3 full_threads_per_block(block_size_x, block_size_y);
+
+    matrix_weight_add_kernel<<<full_blocks_per_grid, full_threads_per_block>>>(A.data_handle(), B.data_handle(), C.data_handle(), 
+        n_row_a, n_dim_a, w1, w2);
+} 
+
+template<typename ElementType, typename IndexType>
+inline void refine(raft::device_resources const& dev_resources,
+                   raft::device_matrix_view<ElementType, IndexType> const& dataset,
+                   raft::device_matrix_view<ElementType, IndexType> const& queries,
+                   raft::device_matrix_view<IndexType, IndexType> const& neighbor_candidates,
+                   raft::device_matrix_view<IndexType, IndexType> indices, 
+                   raft::device_matrix_view<ElementType, IndexType> distances)  
+{
+    IndexType n_data = dataset.extent(0);
+    IndexType n_dim = dataset.extent(1);
+    IndexType n_queries = queries.extent(0);
+
+    IndexType n_candi = neighbor_candidates.extent(1);
+    IndexType k = indices.extent(1);
+
+    auto candi_vec = parafilter_mmr::make_device_matrix_view<ElementType, IndexType>(n_queries, n_dim * n_candi);
+    select_elements<ElementType, IndexType>(dev_resources, dataset, neighbor_candidates, candi_vec);
+
+    int full_blocks_per_grid_x = (n_queries + block_size_x - 1) / block_size_x;
+    int full_blocks_per_grid_y = (n_candi + block_size_y - 1) / block_size_y;
+
+    dim3 full_blocks_per_grid(full_blocks_per_grid_x, full_blocks_per_grid_y);
+    dim3 full_threads_per_block(block_size_x, block_size_y);
+
+    auto refine_dis = parafilter_mmr::make_device_matrix_view<ElementType, IndexType>(n_queries, n_candi);
+    calc_refine_distance_kernel<<<full_blocks_per_grid, full_threads_per_block>>>(candi_vec.data_handle(), 
+                queries.data_handle(), n_dim, n_queries, n_candi, refine_dis.data_handle());
+    
+    auto refine_indices = parafilter_mmr::make_device_matrix_view<IndexType, IndexType>(n_queries, k);
+    raft::matrix::select_k<ElementType, IndexType>(dev_resources, refine_dis, std::nullopt, distances, refine_indices, true);
+
+    select_elements<IndexType, IndexType>(dev_resources, neighbor_candidates, refine_indices, indices, false);
+    auto indices_ptr = indices.data_handle();
+    LOG(INFO) << "cur query batch finished";
+}
+
+template<typename ElementType, typename IndexType>
+void merge_intermediate_result(raft::device_resources const& dev_resources,
+                               const std::string &file_path, 
+                               IndexType batch_size, 
+                               IndexType data_batch_size, 
+                               IndexType n_queries, 
+                               int topk, 
+                               IndexType start_offset, 
+                               raft::device_matrix_view<ElementType, IndexType> merged_dis_view, 
+                               raft::device_matrix_view<IndexType, IndexType> merged_idx_view) 
+{
+    std::vector<std::vector<ElementType>> dis_matrices;
+    std::vector<std::vector<IndexType>> idx_matrices;
+
+    read_matrices_from_file(file_path, n_queries, topk, batch_size, dis_matrices);
+    read_matrices_from_file(file_path, n_queries, topk, batch_size, idx_matrices);
+
+    auto dis_view = parafilter_mmr::make_device_matrix_view<ElementType, IndexType>(n_queries, topk * batch_size);
+    auto idx_view = parafilter_mmr::make_device_matrix_view<IndexType, IndexType>(n_queries, topk * batch_size);
+    merge_matrices_to_gpu(dis_matrices, dis_view.data_handle(), n_queries, topk, batch_size);
+    merge_matrices_to_gpu(idx_matrices, idx_view.data_handle(), n_queries, topk, batch_size);
+
+    dim3 block_dim(block_size_x, block_size_y); 
+    dim3 grid_dim((batch_size + block_dim.x - 1) / block_dim.x, (n_queries + block_dim.y - 1) / block_dim.y);
+    modify_blocks<<<grid_dim, block_dim>>>(idx_view.data_handle(), n_queries, topk, 
+                    batch_size, start_offset, data_batch_size);
+
+    auto merged_idx_indirect_view =  parafilter_mmr::make_device_matrix_view<IndexType, IndexType>(n_queries, topk);
+    
+    raft::matrix::select_k<ElementType, IndexType>(
+        dev_resources, dis_view, std::nullopt, merged_dis_view, merged_idx_view, true
+    );
+
+    select_elements<IndexType, IndexType>(dev_resources, idx_view, 
+                         merged_idx_indirect_view, merged_idx_view, false);
+}
+
+template <typename m_t, typename idx_t = int>
+void sliceMatrix(const m_t* in,
+                 idx_t n_rows,
+                 idx_t n_cols,
+                 m_t* out,
+                 idx_t x1,
+                 idx_t y1,
+                 idx_t x2,
+                 idx_t y2,
+                 bool row_major)
+{
+  auto lda = row_major ? n_cols : n_rows;
+  dim3 block(256);
+  dim3 grid(((x2 - x1) * (y2 - y1) + block.x - 1) / block.x);
+  if (row_major)
+    slice<<<grid, block>>>(in, lda, out, y1, x1, y2, x2);
+  else
+    slice<<<grid, block>>>(in, lda, out, x1, y1, x2, y2);
+}
+
+template <typename m_t, typename idx_t, typename layout_t>
+void slice(raft::resources const& handle,
+           raft::device_matrix_view<const m_t, idx_t, layout_t> in,
+           raft::device_matrix_view<m_t, idx_t, layout_t> out,
+           slice_coordinates<idx_t> coords)
+{
+  // todo: add parafilter expects to find the expected dimension semantics
+  sliceMatrix(in.data_handle(),
+                      in.extent(0),
+                      in.extent(1),
+                      out.data_handle(),
+                      coords.row1,
+                      coords.col1,
+                      coords.row2,
+                      coords.col2,
+                      true);
+}
