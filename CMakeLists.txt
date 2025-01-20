@@ -42,5 +42,5 @@ include(cmake/thirdparty/get_raft.cmake)
 add_library(easylogging src/easylogging++.cc)
 target_compile_definitions(easylogging PUBLIC ELPP_THREAD_SAFE)
 
-add_executable(parafilter src/ivf_parafilter_cuda.cu)
-target_link_libraries(IVF_PQ_EXAMPLE PRIVATE raft::raft raft::compiled easylogging)
+add_executable(parafilter src/parafilter_cuda.cu)
+target_link_libraries(parafilter PRIVATE raft::raft raft::compiled easylogging)
