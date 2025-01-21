@@ -147,9 +147,7 @@ void parafilter_query(raft::device_resources const& dev_resources,
 
   raft::matrix::select_k<float, uint64_t>(dev_resources, dis, std::nullopt, first_val, first_idx, true, true);
   select_elements<float, uint64_t>(dev_resources, data_labels, first_idx, first_candi_labels);
-  cudaDeviceSynchronize();
-  auto first_idx_ptr = first_idx.data_handle();
-  auto first_val_ptr = first_val.data_handle();
+  select_elements<float, uint64_t>(dev_resources, vec_dis, first_idx, first_val, false);
 
   auto second_indices = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk * exps[1]);
   filter_candi_by_labels(dev_resources, first_candi_labels, ranges, first_val, topk * exps[1], second_indices);
@@ -375,6 +373,41 @@ void calc_mem_predictor_coeff(raft::device_resources const& dev_resources,
     coeff[i] = mat[i][4];
 }
 
+void process_compute_filter_config(
+    const filter_config& config,
+    std::vector<float>& shift_differences,
+    std::vector<std::vector<float>>& map_intervals_len) 
+{
+  if (config.shift_val.size() != 2 * config.l) {
+    throw std::invalid_argument("shift_val size must be 2 * l");
+  }
+
+  shift_differences.clear();
+  for (size_t i = 0; i < config.l; ++i) {
+    float left = config.shift_val[i * 2];
+    float right = config.shift_val[i * 2 + 1];
+    shift_differences.push_back(std::abs(right - left));
+  }
+
+  interval_interpolations.clear();
+  for (const auto& intervals : config.interval_map) {
+    if (interval.size() < 2) {
+      throw std::invalid_argument("Each interval in interval_map must have at least two elements");
+    }
+
+    std::vector<float> invervals_len;
+    size_t n_points = intervals.size() / 2;
+
+    std::vector<float> interpolated_values;
+    for (size_t j = 0; j < n_points; ++j) {
+      float l = intervals[j * 2];
+      float r = intervals[j * 2 + 1];
+      invervals_len.push_back(r - l);
+    }
+    map_intervals_len.push_back(invervals_len);
+  }
+}
+
 void split_task(double* coeff,
                 uint64_t n_data, 
                 uint64_t n_queries,
@@ -566,8 +599,8 @@ void flush_current_res(ElementType *dis, IndexType* idx, size_t size, cudaEvent_
     }
 
     // Generate file paths based on device_id to ensure dictionary order and consistency
-    std::string dis_file_path = path + "distances_" + std::to_string(device_id) + "_" + std::to_string(thread_id);
-    std::string neigh_file_path = path + "neighbors_" + std::to_string(device_id) + "_" + std::to_string(thread_id);
+    std::string dis_file_path = path + "distances_" + std::to_string(device_id);
+    std::string neigh_file_path = path + "neighbors_" + std::to_string(device_id);
 
     // Initialize CUDA streams if not already created
     if (dis_copy_stream == nullptr) {
@@ -732,9 +765,9 @@ int main()
     uint64_t inter_buffer_size = topk * query_batch_size;
     // todo: ping pang the output buffer to increase throughput
     float* selected_distance_device_ptr;
-    selected_distance_device_ptr = (float *)parafilter_mmr::mem_allocator(SWAP_BUFF_COUNT * inter_buffer_size * sizeof(float));
+    cudaMalloc((void **)&selected_distance_device_ptr, SWAP_BUFF_COUNT * inter_buffer_size * sizeof(float));
     uint64_t* selected_indices_device_ptr;
-    selected_indices_device_ptr = (uint64_t *)parafilter_mmr::mem_allocator(SWAP_BUFF_COUNT * inter_buffer_size * sizeof(uint64_t));
+    cudaMalloc((void **)&selected_indices_device_ptr, SWAP_BUFF_COUNT * inter_buffer_size * sizeof(uint64_t));
 
     raft::device_matrix_view<float, uint64_t> selected_distance{};
     raft::device_matrix_view<uint64_t, uint64_t> selected_indices{};
@@ -792,6 +825,8 @@ int main()
     cudaDeviceSynchronize();
     LOG(INFO) << "device: " << i << "build time:" << build_time << ", query time:" << query_time;
     parafilter_mmr::free_cur_workspace_device_mems();
+    cudaFree(selected_distance_device_ptr);
+    cudaFree(selected_indices_device_ptr);
     flush_current_res((float*)0, (uint64_t*)0, 0, dis_copy_done_event[0], idx_copy_done_event[0], compute_done_event[0], 
                       i, "./res/", true);
   };

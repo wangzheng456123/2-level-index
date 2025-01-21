@@ -115,6 +115,7 @@ __global__ void normalize_constrains_kernel(const float* constrains, int l, int 
 
 // todo: per elements processing kernel can be implement with device lamda.
 // use none-const labels to enable on-site process
+/*
 __global__ void normalize_labels_kernel(float* data_labels, float* normalized_data_labels, 
     uint64_t n_data, float coeff, float data_shift, float global_min, float global_max) 
 {
@@ -124,12 +125,70 @@ __global__ void normalize_labels_kernel(float* data_labels, float* normalized_da
 }
 
 __global__ void denormalize_labels_kernel(const float* data, uint64_t n_data, 
-    float data_shift, float *out) 
+    float data_shift_l, float data_shift_r, float *out) 
 {
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x; 
     if (tid >= n_data) return;
-    out[tid * 2] = data[tid] - data_shift;
-    out[tid * 2 + 1] = data[tid];
+    out[tid * 2] = data[tid] - data_shift_l;
+    out[tid * 2 + 1] = data[tid] + data_shift_r;
+}*/
+
+__global__ void denormalize_labels_kernel(const float* data, uint64_t n_data, 
+    const float* shift_val, const int* map_types, const int* interval_map, uint64_t l, float* out) 
+{
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x; 
+    if (tid >= n_data) return;
+    
+    for (uint64_t i = 0; i < l; ++i) {
+        uint64_t idx = tid * l + i;
+
+        if (map_types[i] == 0) {
+            out[idx * 2] = data[tid] - shift_val[i];
+            out[idx * 2 + 1] = data[tid] + shift_val[i];
+        } else if (map_types[i] == 1) {
+            int val = data[idx];
+            out[idx * 2] = interval_map[2 * val];
+            out[idx * 2 + 1] = interval_map[2 * val + 1];
+        }
+    }
+}
+
+__global__ void normalize_ranges_labels_kernel(float* normalized_data_labels, 
+    uint64_t n_data, float global_min, const float* ranges, uint64_t l) 
+{
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x; 
+    if (tid >= n_data) return;
+    
+    for (uint64_t i = 0; i < l; ++i) {
+        uint64_t idx = tid * l + i;
+        float left = ranges[idx * 2];
+        float right = ranges[idx * 2 + 1];
+        float midpoint = (left + right) / 2.0f;
+        float coeff = 2 / (right - left);
+        normalized_data_labels[idx] = (data_labels[idx] - global_min) * coeff;
+    }
+}
+
+__global__ void normalize_data_labels_kernel(const float* data, uint64_t n_data, 
+    const float* map_ranges_len, const float* intervals_len, float global_min, 
+    uint64_t l, float* out) 
+{
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x; 
+    if (tid >= n_data) return;
+    
+    for (uint64_t i = 0; i < l; ++i) {
+        uint64_t idx = tid * l + i;
+        float coeff = 0.f;
+
+        if (map_types[i] == 0) {
+            coeff = 2.f / intervals_len[l];
+        } else if (map_types[i] == 1) {
+            int val = data[idx];
+            coeff = 2.f / map_ranges_len[val];
+        }
+
+        out[idx] = (data[idx] - global_min) * coeff;
+    }
 }
 
 template <typename ElementType, typename IndexType>
@@ -337,11 +396,11 @@ inline void filter_candi_by_labels(raft::device_resources const& dev_resources,
     auto select_val = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_constrains, topk);
 
     raft::matrix::select_k<float, uint64_t>(dev_resources, pq_dis, std::nullopt, select_val, fcandi, true, true);
+
     full_blocks_per_grid.y = (topk + block_size_y - 1) / block_size_y;
     process_selected_indices_kernel<<<full_blocks_per_grid, full_thread_per_grid>>>(select_val.data_handle(), fcandi.data_handle(), 
         n_constrains, topk);
     
-    auto selected_val = select_val.data_handle();
     return ;
 }
 
@@ -460,11 +519,12 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
                                  raft::device_matrix_view<ElementType, IndexType> normalized_query_labels,
                                  raft::device_matrix_view<ElementType, IndexType> denormalized_query_labels,
                                  ElementType global_min, 
-                                 ElementType global_max, 
+                                 ElementType global_max,
+                                 ElementType *shift_value, 
+                                 ElementType *map_value, 
                                  bool is_query_changed = true,
                                  bool is_data_changed = true, 
-                                 ElementType left = 0, 
-                                 ElementType right = 3 * 24 * 3600) 
+                                 ) 
 {
     IndexType n_data = normalized_data_labels.extent(0);
     IndexType n_queries = normalized_query_labels.extent(0);
@@ -477,7 +537,7 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
     float coeff = 1;
     if (left + right != 0) 
         coeff = 2.0 / (left + right);
-    float shift_val = right - left;
+    float shift_val = (right - left) / 2;
 
     // todo fuse the 3 kernel calls to 1
     if (is_data_changed) {
@@ -488,7 +548,7 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
     if (is_query_changed) {
         full_block_per_grid.x = (n_queries + block_size - 1) / block_size;
         denormalize_labels_kernel<<<full_block_per_grid, block_size>>>(query_labels.data_handle(), 
-            n_queries, shift_val, denormalized_query_labels.data_handle());
+            n_queries, right, 0, denormalized_query_labels.data_handle());
 
         normalize_labels_kernel<<<full_block_per_grid, block_size>>>(query_labels.data_handle(),  
             normalized_query_labels.data_handle(), n_queries, coeff, shift_val, global_min, global_max);
@@ -630,6 +690,7 @@ inline void refine(raft::device_resources const& dev_resources,
     auto refine_indices = parafilter_mmr::make_device_matrix_view<IndexType, IndexType>(n_queries, k);
     raft::matrix::select_k<ElementType, IndexType>(dev_resources, refine_dis, std::nullopt, distances, refine_indices, true);
 
+    auto refine_indices_ptr = refine_indices.data_handle();
     select_elements<IndexType, IndexType>(dev_resources, neighbor_candidates, refine_indices, indices, false);
     auto indices_ptr = indices.data_handle();
     LOG(INFO) << "cur query batch finished";

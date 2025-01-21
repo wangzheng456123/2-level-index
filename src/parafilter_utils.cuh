@@ -50,6 +50,95 @@ inline uint32_t get_cur_device_maxi_threads() {
   return devProp.multiProcessorCount * devProp.maxThreadsPerMultiProcessor;
 }
 
+// todo: put these helpers to a seperate file.
+inline
+std::string& toUpper(std::string& str) 
+{
+  std::transform(str.begin(), str.end(), str.begin(),
+  [](char c) {
+    return static_cast<char>(::toupper(c));
+  });
+    return str;
+}
+inline
+bool contains(const char* str, char c) {
+  for (; *str; ++str) {
+    if (*str == c)
+      return true;
+  }
+  return false;
+}
+inline
+std::string& ltrim(std::string& str) {
+  str.erase(str.begin(), std::find_if(str.begin(), str.end(), [](char c) {
+  return !std::isspace(c);
+  } ));
+  return str;
+}
+inline
+std::string& rtrim(std::string& str) {
+  str.erase(std::find_if(str.rbegin(), str.rend(), [](char c) {
+    return !std::isspace(c);
+  }).base(), str.end());
+  return str;
+}
+inline
+std::string& trim(std::string& str) {
+  return ltrim(rtrim(str));
+}
+inline
+bool isInteger(const std::string& str) {
+  if (str.empty()) return false;
+
+  size_t i = 0;
+  if (str[i] == '+' || str[i] == '-') {
+      i++;
+  }
+
+  for (; i < str.size(); i++) {
+      if (!isdigit(str[i])) {
+          return false;
+      }
+  }
+  return i > 0;
+}
+inline
+std::string remove_spaces(const std::string& str) {
+  std::string result;
+  for (char ch : str) {
+    if (!isspace(ch)) {
+      result += ch;
+    }
+  }
+  return result;
+}
+template <typename T>
+std::vector<T> parse_array(const std::string& str) {
+  std::vector<T> result;
+  std::string cleaned_str = str;
+
+  if (!cleaned_str.empty() && cleaned_str.front() == '[') {
+    cleaned_str.erase(0, 1); 
+  }
+  if (!cleaned_str.empty() && cleaned_str.back() == ']') {
+    cleaned_str.pop_back(); 
+  }
+
+  std::stringstream ss(cleaned_str);
+  std::string token;
+
+  while (std::getline(ss, token, ',')) {
+    token.erase(0, token.find_first_not_of(" \t"));
+    token.erase(token.find_last_not_of(" \t") + 1);
+
+    if (!token.empty()) {
+      result.push_back(static_cast<T>(std::stod(token))); 
+    }
+  }
+
+  return result;
+}
+
 struct parafilter_config {
   uint64_t data_width;
   uint64_t index_width;
@@ -118,54 +207,76 @@ struct parafilter_config {
   }
 
   private:
-  std::string& toUpper(std::string& str) {
-    std::transform(str.begin(), str.end(), str.begin(),
-    [](char c) {
-      return static_cast<char>(::toupper(c));
-    });
-    return str;
-  }
-  bool contains(const char* str, char c) {
-    for (; *str; ++str) {
-      if (*str == c)
-        return true;
-    }
-    return false;
-  }
-  std::string& ltrim(std::string& str) {
-    str.erase(str.begin(), std::find_if(str.begin(), str.end(), [](char c) {
-    return !std::isspace(c);
-    } ));
-    return str;
-  }
-  std::string& rtrim(std::string& str) {
-    str.erase(std::find_if(str.rbegin(), str.rend(), [](char c) {
-      return !std::isspace(c);
-    }).base(), str.end());
-    return str;
-  }
-  std::string& trim(std::string& str) {
-    return ltrim(rtrim(str));
-  }
-
-  bool isInteger(const std::string& str) {
-    if (str.empty()) return false;
-
-    size_t i = 0;
-    if (str[i] == '+' || str[i] == '-') {
-        i++;
-    }
-
-    for (; i < str.size(); i++) {
-        if (!isdigit(str[i])) {
-            return false;
-        }
-    }
-    return i > 0;
-  }
-
   /*initialize string to offset data in class static function*/
   static std::map<std::string, int> str_to_offset_map;
+};
+
+class filter_config {
+public:
+  int l;  
+  std::vector<int> filter_type;  
+  std::vector<std::vector<float>> shift_val;  
+  std::vector<std::vector<int>> interval_map; 
+
+  filter_config(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+      throw std::runtime_error("Unable to open configuration file: " + filename);
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+      line = removes_paces(line);
+
+      if (line.empty() || line[0] == '#') {
+        continue; 
+      }
+
+      if (line.find("l=") == 0) {
+        l = std::stoi(line.substr(2));
+        filter_type.resize(l);
+        shift_val.resize(l);
+        interval_map.resize(l);
+      } else if (line.find("filter") == 0) {
+        int filter_index = std::stoi(line.substr(6));
+
+        while (std::getline(file, line)) {
+          line = remove_spaces(line);
+          if (line.empty()) break; 
+
+          if (line.find("type=") == 0) {
+            filter_type[filter_index] = std::stoi(line.substr(5));
+          } else if (line.find("shift_val=") == 0) {
+            shift_val[filter_index] = parse_array<float>(line.substr(10));
+          } else if (line.find("interval_map=") == 0) {
+            interval_map[filter_index] = parse_array<int>(line.substr(13));
+          }
+        }
+      }
+    }
+  }
+
+  void print_config() const {
+    std::cout << "l = " << l << std::endl;
+    for (int i = 0; i < l; ++i) {
+      std::cout << "Filter " << i << ":" << std::endl;
+      std::cout << "  Type: " << filter_type[i] << std::endl;
+      std::cout << "  Shift Values: ";
+      for (float val : shift_val[i]) {
+        std::cout << val << " ";
+      }
+      std::cout << std::endl;
+
+      std::cout << "  Interval Map: ";
+      for (int val : interval_map[i]) {
+        std::cout << val << " ";
+      }
+      std::cout << std::endl;
+    }
+  }
+
+private:
+  
 };
 
 class Timer {
