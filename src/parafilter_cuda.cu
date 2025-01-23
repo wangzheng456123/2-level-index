@@ -205,7 +205,8 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                           float* global_max,
                           const filter_config &f_config, 
                           float merge_rate = 0.035, 
-                          bool run_build = true) 
+                          bool run_build = true, 
+                          bool reconfig = false) 
 {
     size_t n_data = dataset.extent(0);
     size_t n_queries = queries.extent(0);
@@ -243,7 +244,8 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                     global_max, 
                     f_config, 
                     true, 
-                    is_data_changed
+                    is_data_changed, 
+                    reconfig
                 ), 
                     query_time
     );
@@ -314,7 +316,7 @@ void calc_mem_predictor_coeff(raft::device_resources const& dev_resources,
   #define call_fake_run \
     parafilter_build_run(dev_resources, queries_fake, dataset_fake, \ 
                           data_labels_fake, query_labels_fake, selected_distance_fake, \ 
-                          selected_indices_fake, pq_dim, n_clusters, exps, topk, null_global.data(), null_global.data(), f_config); 
+                          selected_indices_fake, pq_dim, n_clusters, exps, topk, null_global.data(), null_global.data(), f_config, 0.035, true, true); 
   
   #define call_calc_fake_matrix_size \
       parafilter_calc_input_size_map(input_size_map, pq_dim, n_dim, l, fake_data_cnt, fake_query_cnt, n_clusters, topk);
@@ -385,7 +387,8 @@ void split_task(double* coeff,
                 uint64_t mem_bound, 
                 uint64_t &query_batch_size, 
                 uint64_t &data_batch_size, 
-                uint64_t aditional = 0)  
+                uint64_t aditional = 0, 
+                uint64_t lowest_query_batch_size = 125)  
 {
   uint64_t available, total;
   get_current_device_mem_info(available, total);
@@ -401,13 +404,13 @@ void split_task(double* coeff,
     uint64_t l_d = topk;
 
     uint64_t r_q = n_queries;
-    uint64_t l_q = 0;
+    uint64_t l_q = 1;
 
     while (1) {
       uint64_t mid_d = (r_d + l_d + 1) >> 1;
 
       r_q = n_queries;
-      l_q = 0;
+      l_q = 1;
 
       while (l_q < r_q) {
         uint64_t mid_q = (l_q + r_q + 1) >> 1;
@@ -419,9 +422,9 @@ void split_task(double* coeff,
         if (value > upper_bound) r_q = mid_q - 1;
         else l_q = mid_q; 
       } 
-      if (l_q == 0) r_d = mid_d - 1;
+      if (l_q < 125) r_d = mid_d - 1;
       else l_d = mid_d;
-      if (l_d == r_d && l_q) break;
+      if (l_d == r_d && l_q >= 125) break;
     }
 
     query_batch_size = l_q;
@@ -430,6 +433,7 @@ void split_task(double* coeff,
   // todo: when cannot find proper batch size for current upper bound, enlarge it
   bisearch_proper_split(upper_bound);
   while (n_queries % query_batch_size != 0) query_batch_size--;
+  data_batch_size = findMaxFactor(data_batch_size, n_data);
 }
 
 void calculate_batch_min_max(const std::string& path, std::vector<float> &global_min, std::vector<float> &global_max, 
@@ -454,6 +458,10 @@ void calculate_batch_min_max(const std::string& path, std::vector<float> &global
 
     split_task(coeff, n_data, n_queries, 1, 
               2ll * 1024 * 1024 * 1024, query_batch_size, data_batch_size);
+    
+    if (data_batch_size > 1e6) {
+      data_batch_size = findMaxFactor(1e6, n_data);
+    }
 
     while (data_offset < n_data * l * sizeof(float)) {
         size_t bytes_to_read = std::min(data_batch_size * l * sizeof(float), n_data * l * sizeof(float) - data_offset);
@@ -554,7 +562,7 @@ inline void split_uniform(uint64_t n, uint64_t m, uint64_t i,
 template<typename ElementType, typename IndexType>
 void flush_current_res(ElementType *dis, IndexType* idx, size_t size, cudaEvent_t &dis_copy_done_event, 
                        cudaEvent_t &idx_copy_done_event, const cudaEvent_t &compute_done_event, int device_id, std::string const& path = "res/",
-                       bool force_flush = false) 
+                       bool force_flush = false, bool overwrite = false, bool reset_offset = false) 
 {
     thread_local ElementType* dis_buff = nullptr;
     thread_local IndexType* indices_buff = nullptr;
@@ -564,6 +572,11 @@ void flush_current_res(ElementType *dis, IndexType* idx, size_t size, cudaEvent_
     thread_local int thread_id = -1;
     thread_local cudaStream_t dis_copy_stream = nullptr;
     thread_local cudaStream_t idx_copy_stream = nullptr;
+
+    if (reset_offset) {
+      offset = 0;
+      file_offset = 0;
+    }
 
     if (thread_id == -1) {
         // Use a stable hashing method to ensure consistent thread ID
@@ -593,10 +606,12 @@ void flush_current_res(ElementType *dis, IndexType* idx, size_t size, cudaEvent_
     // If buffer is full or forced to flush, write to disk
     if (offset + size >= buff_size || force_flush) {
 
+        LOG(INFO) << "device: " << device_id << ", flush tmp res with offset: " << 
+                offset << "with file offset: " << file_offset << ", overwrite: " << overwrite;
         auto dis_write_future = 
-            write_binary_file_async(dis_file_path, file_offset * sizeof(ElementType), (void*)dis_buff, offset * sizeof(ElementType));
+            write_binary_file_async(dis_file_path, file_offset * sizeof(ElementType), (void*)dis_buff, offset * sizeof(ElementType), !overwrite);
         auto neigh_write_future = 
-            write_binary_file_async(neigh_file_path, file_offset * sizeof(IndexType), (void*)indices_buff, offset * sizeof(IndexType));
+            write_binary_file_async(neigh_file_path, file_offset * sizeof(IndexType), (void*)indices_buff, offset * sizeof(IndexType), !overwrite);
 
         if (force_flush) {
             // Wait for async writes to complete
@@ -667,6 +682,7 @@ int main()
   parafilter_mmr::init_mmr();
 
   parafilter_config *p_config = nullptr;
+
   get_parafilter_config(&p_config);
   std::string dataset_path = p_config->path;
 
@@ -676,7 +692,9 @@ int main()
   std::map<std::string, std::string> types;
   get_data_type_list(types, std::string(dataset_path + "dtypes").c_str(), keys);
 
-  filter_config f_config("filter.conf");
+  std::string filter_conf_path = dataset_path + "filter.conf";
+
+  filter_config f_config(filter_conf_path);
 
   if (p_config->break_down) break_down = true;
   std::map<std::string, std::pair<int32_t, int32_t>> size_map;
@@ -802,7 +820,36 @@ int main()
     cudaFree(selected_distance_device_ptr);
     cudaFree(selected_indices_device_ptr);
     flush_current_res((float*)0, (uint64_t*)0, 0, dis_copy_done_event[0], idx_copy_done_event[0], compute_done_event[0], 
-                      i, "./res/", true);
+                      i, "res/", true);
+    if (data_batch_size != tot_samples) {
+      uint64_t batch_size = (tot_samples + data_batch_size - 1) / data_batch_size;
+      auto merged_dis_view = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, topk);
+      auto merged_idx_view = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk);
+
+      merge_intermediate_result<float, uint64_t>(
+                                dev_resources,
+                                "res/", 
+                                batch_size, 
+                                data_batch_size, 
+                                n_queries, 
+                                topk, 
+                                0l, 
+                                i, 
+                                merged_dis_view, 
+                                merged_idx_view);
+      cudaEventRecord(compute_done_event[0]);
+      // todo: process the case when output buffer large than the tmp buffer
+      flush_current_res(merged_dis_view.data_handle(), merged_idx_view.data_handle(), 
+                          topk * n_queries, dis_copy_done_event[0], idx_copy_done_event[0], compute_done_event[0], 
+                          i, "res/", false, false, true);
+
+      cudaEventSynchronize(dis_copy_done_event[0]);
+      cudaEventSynchronize(idx_copy_done_event[0]);
+
+      flush_current_res((float*)0, (uint64_t*)0, 0, dis_copy_done_event[0], idx_copy_done_event[0], compute_done_event[0], 
+                      i, "res/", true, true);
+      parafilter_mmr::free_cur_workspace_device_mems();
+    }  
   };
 
   std::vector<std::thread> workers;

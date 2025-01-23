@@ -155,6 +155,7 @@ struct parafilter_config {
   uint64_t enable_multi_gpu;
   uint64_t mem_bound;
   uint64_t is_calc_mem_predictor_coeff;
+  uint64_t lowest_query_batch;
   float merge_rate;
 
   std::string dataset;
@@ -380,6 +381,29 @@ int gauss(ElementType a[][5], IndexType n = 4)
             a[i][n]-=a[j][n]*a[i][j];
     return 0;
 }
+
+int findMaxFactor(uint64_t a, uint64_t b) {
+    if (b <= a) {
+        return b; 
+    }
+
+    int maxFactor = 1;
+
+    for (int i = 1; i <= sqrt(b); ++i) {
+        if (b % i == 0) {
+            if (i < a) {
+                maxFactor = max(maxFactor, i);
+            }
+            int pairFactor = b / i;
+            if (pairFactor < a) {
+                maxFactor = max(maxFactor, pairFactor);
+            }
+        }
+    }
+
+    return maxFactor;
+}
+
 
 //fixme: fake run use macro is not simple to control the, 
 //call in any levels, try to find better way 
@@ -636,26 +660,45 @@ void read_matrices_from_file(const std::string& file_path, IndexType n_queries, 
     }
 }
 
-inline std::future<bool> write_binary_file_async(const std::string& file_path, uint64_t offset, const void* data, uint64_t size) {
+inline std::future<bool> write_binary_file_async(const std::string& file_path, uint64_t offset, const void* data, uint64_t size, bool append = true) {
     // Launch an asynchronous task to handle file writing
-    return std::async(std::launch::async, [file_path, offset, data, size]() -> bool {
+    return std::async(std::launch::async, [file_path, offset, data, size, append]() -> bool {
 
-        std::ofstream file(file_path.c_str(), std::ios::binary | std::ios::in | std::ios::out);
-        // Try opening the file in read-write mode
-        if (!file) {
-            // If the file doesn't exist, open it in write-only mode to create it
-            file.open(file_path.c_str(), std::ios::binary | std::ios::out);
-            if (!file) {
-                std::cerr << "Failed to open or create file: " << file_path << std::endl;
-                return false;
+        // Determine the open mode based on the append parameter
+        std::ios::openmode mode = std::ios::binary;
+        if (append) {
+            mode |= std::ios::app;
+        }
+
+        // If not appending and the file exists, delete the existing file
+        if (!append) {
+            std::ifstream existing_file(file_path);
+            if (existing_file) {
+                existing_file.close(); // Close the file before deleting
+                if (std::remove(file_path.c_str()) != 0) {
+                    std::cerr << "Failed to delete existing file: " << file_path << std::endl;
+                    return false;
+                }
             }
         }
 
-        // Seek to the specified offset
-        file.seekp(offset);
+        // Open the file with the appropriate mode
+        std::ofstream file(file_path.c_str(), mode);
+
+        // Try opening the file
         if (!file) {
-            std::cerr << "Failed to seek to offset in file: " << file_path << std::endl;
+            std::cerr << "Failed to open or create file: " << file_path << std::endl;
             return false;
+        }
+
+        // If in append mode, ignore the offset and write at the end of the file
+        if (!append) {
+            // Seek to the specified offset
+            file.seekp(offset);
+            if (!file) {
+                std::cerr << "Failed to seek to offset in file: " << file_path << std::endl;
+                return false;
+            }
         }
 
         // Write data to the file
@@ -968,4 +1011,5 @@ std::map<std::string, int> parafilter_config::str_to_offset_map = { \
       {"MEM_BOUND", offsetof(parafilter_config, mem_bound)}, \
       {"IS_CALC_MEM_PREDICTOR_COEFF", offsetof(parafilter_config, is_calc_mem_predictor_coeff)}, \
       {"MERGE_RATE", offsetof(parafilter_config, merge_rate)}, \
+      {"LOWEST_QUERY_BATCH", offsetof(parafilter_config, lowest_query_batch)}, \
 };

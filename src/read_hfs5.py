@@ -18,7 +18,7 @@ def get_data_file_path(data: str) -> str:
     if data == "ann":
         return "/home/zwang/ag_news-384-euclidean.hdf5"
     elif data == "label":
-        return "/home/zwang/app_reviews-384-euclidean-filter.hdf5"
+        return "/home/zwang/amazon-384-euclidean-5filter.hdf5"
     else:
         raise TypeError("The data filter is not supported!")
 
@@ -29,37 +29,46 @@ def process_key_data(f, key, dir_path: str):
         a = process_dataset(a)
         if is_label(key):
             rows_to_write = a[:100]
-            # np.savetxt(dir_path + key + ".txt", rows_to_write, delimiter=',', fmt='%.6f')
+            np.savetxt(dir_path + key + ".txt", rows_to_write, delimiter=',', fmt='%.6f')
     else:
         fmt = '%.10f'
         if a.dtype == 'int32':
             fmt = '%d'
-        # np.savetxt(dir_path + key + '.txt', a, fmt)
+        np.savetxt(dir_path + key + '.txt', a, fmt)
 
-    # a.tofile(dir_path + key)
+    a.tofile(dir_path + key)
     size = np.array([a.shape[0], a.shape[1]], np.int32)
-    # size.tofile(dir_path + key + "_size")
+    size.tofile(dir_path + key + "_size")
     return key, a.dtype
 
 def process_neighbors(f):
-    """Process neighbors, train_labels, and test_labels."""
+    """Process neighbors, train_labels, and test_labels and compute min/max of dif vectors."""
     neighbors = np.array(f["neighbors"])
     train_labels = np.array(f["train_label"])
     test_labels = np.array(f["test_label"])
 
+    dif_list = [] 
+
     for i in range(neighbors.shape[0]):
+        test_label_row = test_labels[i]
         for idx in neighbors[i]:
             train_data_from_neighbors = train_labels[idx]
-            print(f"Neighbors (row {i}): {idx}")
-            print(f"Train labels from neighbors (row {i}): {train_data_from_neighbors}")
+            dif = train_data_from_neighbors - test_label_row
+            print(train_data_from_neighbors)
+            if dif[1] > 30 or dif[1] < -30 or dif[0] > 0:
+                continue
+            dif_list.append(dif)  
+            print(f"dif : {dif}")
 
-            test_label_row = test_labels[i]
-            print(f"Test label (row {i}): {test_label_row}")
+    if dif_list:
+        dif_array = np.array(dif_list)  
+        max_values = np.max(dif_array, axis=0)  
+        min_values = np.min(dif_array, axis=0)  
 
-            if np.all(train_data_from_neighbors == test_label_row):
-                print(f"Row {i}: Train labels match the test label!")
-            else:
-                print(f"Row {i}: Train labels do not match the test label!")
+        print(f"Dif vector max values (per dimension): {max_values}")
+        print(f"Dif vector min values (per dimension): {min_values}")
+    else:
+        print("No dif vectors found.")
 
 def read_hdf5(data: str = "ann"):
     """Read and process the HDF5 file."""
@@ -69,13 +78,13 @@ def read_hdf5(data: str = "ann"):
     keys = []
     types = []
 
-    dir_path = "../build/dataset/app_review/"
+    dir_path = "../build/dataset/amazon/"
 
-    for key in f.keys():
-        key, dtype = process_key_data(f, key, dir_path)
-        keys.append(key)
-        types.append(dtype)
-        print(key)
+    #for key in f.keys():
+    #    key, dtype = process_key_data(f, key, dir_path)
+    #    keys.append(key)
+    #    types.append(dtype)
+    #    print(key)
 
     for dtype in types:
         print(dtype)
