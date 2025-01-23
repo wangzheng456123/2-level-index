@@ -133,61 +133,65 @@ __global__ void denormalize_labels_kernel(const float* data, uint64_t n_data,
     out[tid * 2 + 1] = data[tid] + data_shift_r;
 }*/
 
-__global__ void denormalize_labels_kernel(const float* data, uint64_t n_data, 
-    const float* shift_val, const int* map_types, const int* interval_map, uint64_t l, float* out) 
+__global__ void denormalize_labels_kernel(const float* data, uint64_t n_data,
+    const float* shift_val, const int* map_types, const float* interval_map, uint64_t l, float* out)
 {
-    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x; 
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_data) return;
-    
+
     for (uint64_t i = 0; i < l; ++i) {
         uint64_t idx = tid * l + i;
 
         if (map_types[i] == 0) {
-            out[idx * 2] = data[tid] - shift_val[i];
-            out[idx * 2 + 1] = data[tid] + shift_val[i];
-        } else if (map_types[i] == 1) {
-            int val = data[idx];
+            out[idx * 2] = data[idx] - max(shift_val[2 * i], 1e-7);
+            out[idx * 2 + 1] = data[idx] + max(shift_val[2 * i + 1], 1e-7);
+        }
+        else if (map_types[i] == 1) {
+            int val = data[idx] - 1;
             out[idx * 2] = interval_map[2 * val];
             out[idx * 2 + 1] = interval_map[2 * val + 1];
         }
     }
 }
 
-__global__ void normalize_ranges_labels_kernel(float* normalized_data_labels, 
-    uint64_t n_data, float global_min, const float* ranges, uint64_t l) 
+__global__ void normalize_ranges_labels_kernel(float* normalized_data_labels,
+    uint64_t n_data, float* global_min, float* global_max, const float* ranges, uint64_t l)
 {
-    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x; 
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_data) return;
-    
+
     for (uint64_t i = 0; i < l; ++i) {
         uint64_t idx = tid * l + i;
         float left = ranges[idx * 2];
         float right = ranges[idx * 2 + 1];
         float midpoint = (left + right) / 2.0f;
-        float coeff = 2 / (right - left);
-        normalized_data_labels[idx] = (data_labels[idx] - global_min) * coeff;
+        float coeff = 2.f / (right - left);
+        coeff = 2.f / (global_max[i] - global_min[i]);
+        normalized_data_labels[idx] = (midpoint - global_min[i]) * coeff;
     }
 }
 
-__global__ void normalize_data_labels_kernel(const float* data, uint64_t n_data, 
-    const float* map_ranges_len, const float* intervals_len, float global_min, 
-    uint64_t l, float* out) 
+__global__ void normalize_data_labels_kernel(const float* data, uint64_t n_data,
+    const float* maps_len, const float* shift_len, const int* map_types, float* global_min,
+    float* global_max, uint64_t l, float* out)
 {
-    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x; 
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_data) return;
-    
+
     for (uint64_t i = 0; i < l; ++i) {
         uint64_t idx = tid * l + i;
         float coeff = 0.f;
 
         if (map_types[i] == 0) {
-            coeff = 2.f / intervals_len[l];
-        } else if (map_types[i] == 1) {
-            int val = data[idx];
-            coeff = 2.f / map_ranges_len[val];
+            coeff = 2.f / shift_len[i];
+        }
+        else if (map_types[i] == 1) {
+            int val = data[idx] - 1;
+            coeff = 2.f / maps_len[val];
         }
 
-        out[idx] = (data[idx] - global_min) * coeff;
+        coeff = 2.f / (global_max[i] - global_min[i]);
+        out[idx] = (data[idx] - global_min[i]) * coeff;
     }
 }
 
@@ -259,28 +263,13 @@ __global__ void compute_batched_L2_distance_kernel(
 template <typename T, typename IndexType>
 __global__ void transpose_kernel(const T* __restrict__ input, T* __restrict__ output,
                                   IndexType rows, IndexType cols) {
-    __shared__ T tile[32][32 + 1]; // +1 to avoid bank conflicts
-
     // Thread and block indices
     IndexType x = blockIdx.x * blockDim.x + threadIdx.x;
     IndexType y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Local indices in the shared memory
-    IndexType local_x = threadIdx.x;
-    IndexType local_y = threadIdx.y;
-
-    // Read data from global memory to shared memory
+    // Transpose the matrix directly using global memory
     if (x < cols && y < rows) {
-        tile[local_y][local_x] = input[y * cols + x];
-    }
-    __syncthreads();
-
-    // Transpose the tile and write it back to global memory
-    x = blockIdx.y * blockDim.y + threadIdx.x; // Transposed position
-    y = blockIdx.x * blockDim.x + threadIdx.y;
-
-    if (x < rows && y < cols) {
-        output[y * rows + x] = tile[local_x][local_y];
+        output[x * rows + y] = input[y * cols + x];
     }
 }
 
@@ -518,12 +507,11 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
                                  raft::device_matrix_view<ElementType, IndexType> query_labels, 
                                  raft::device_matrix_view<ElementType, IndexType> normalized_query_labels,
                                  raft::device_matrix_view<ElementType, IndexType> denormalized_query_labels,
-                                 ElementType global_min, 
-                                 ElementType global_max,
-                                 ElementType *shift_value, 
-                                 ElementType *map_value, 
+                                 ElementType* global_min, 
+                                 ElementType* global_max,
+                                 const filter_config& f_config, 
                                  bool is_query_changed = true,
-                                 bool is_data_changed = true, 
+                                 bool is_data_changed = true
                                  ) 
 {
     IndexType n_data = normalized_data_labels.extent(0);
@@ -531,28 +519,99 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
 
     IndexType l_dim = normalized_data_labels.extent(1);
 
+    thread_local float* shift_val_dev = nullptr; 
+    thread_local float* ranges_map_dev = nullptr; 
+    thread_local float* shift_len_dev = nullptr;
+    thread_local float* maps_len_dev = nullptr;
+    thread_local int* map_types_dev = nullptr;
+    thread_local bool is_configed_dev = false;
+
+    thread_local ElementType* global_min_dev = nullptr;
+    thread_local ElementType* global_max_dev = nullptr;
+
+    if (!is_configed_dev) {
+        auto trans_vec_to_device = [](void*& dev_ptr, const void* src, size_t size) {
+            dev_ptr = parafilter_mmr::mem_allocator(size);
+            cudaMemcpy(dev_ptr, src, size, cudaMemcpyHostToDevice);
+        };
+        trans_vec_to_device(reinterpret_cast<void*&>(shift_val_dev), f_config.shift_val.data(), f_config.shift_val.size() * sizeof(float));
+
+        std::vector<float> ranges_map;
+        for (const auto& maps : f_config.interval_map) {
+            for (int value : maps) {
+                ranges_map.push_back(static_cast<float>(value));
+            }
+        }
+        trans_vec_to_device(reinterpret_cast<void*&>(ranges_map_dev), ranges_map.data(), ranges_map.size() * sizeof(float));
+
+        std::vector<float> shift_len;
+        std::vector<std::vector<float>> maps_len;
+        process_filter_config(f_config, shift_len, maps_len);
+
+        trans_vec_to_device(reinterpret_cast<void*&>(shift_len_dev), shift_len.data(), shift_len.size() * sizeof(float));
+
+        std::vector<float> maps_len_flat;
+        for (const auto& map : maps_len) {
+            maps_len_flat.insert(maps_len_flat.end(), map.begin(), map.end());
+        }
+        trans_vec_to_device(reinterpret_cast<void*&>(maps_len_dev), maps_len_flat.data(), maps_len_flat.size() * sizeof(float));
+        trans_vec_to_device(reinterpret_cast<void*&>(map_types_dev), f_config.filter_type.data(), f_config.filter_type.size() * sizeof(int));
+
+        trans_vec_to_device(reinterpret_cast<void*&>(global_min_dev), global_min, f_config.l * sizeof(float));
+        trans_vec_to_device(reinterpret_cast<void*&>(global_max_dev), global_max, f_config.l * sizeof(float));
+
+        is_configed_dev = true;
+    }
+
     int full_block_per_grid_x = (n_data + block_size - 1) / block_size;
     dim3 full_block_per_grid(full_block_per_grid_x);
 
-    float coeff = 1;
-    if (left + right != 0) 
-        coeff = 2.0 / (left + right);
-    float shift_val = (right - left) / 2;
-
     // todo fuse the 3 kernel calls to 1
     if (is_data_changed) {
-        normalize_labels_kernel<<<full_block_per_grid, block_size>>>(data_labels.data_handle(), 
-        normalized_data_labels.data_handle(), n_data, coeff, 0, global_min, global_max);
+         // Call normalize_data_labels_kernel to replace normalize_labels_kernel
+        normalize_data_labels_kernel<<<full_block_per_grid, block_size>>>(
+            data_labels.data_handle(),            // Input data labels
+            n_data,                               // Number of queries
+            maps_len_dev,                         // Device pointer for map lengths
+            shift_len_dev,                        // Device pointer for shift lengths
+            map_types_dev,                        // filter types array
+            global_min_dev,                       // Global minimum value
+            global_max_dev,                       // Global maximum value
+            f_config.l,                           // Length of intervals
+            normalized_data_labels.data_handle()  // Output to normalized_data_labels
+        );
     }
 
     if (is_query_changed) {
+        // Set grid configuration
         full_block_per_grid.x = (n_queries + block_size - 1) / block_size;
-        denormalize_labels_kernel<<<full_block_per_grid, block_size>>>(query_labels.data_handle(), 
-            n_queries, right, 0, denormalized_query_labels.data_handle());
 
-        normalize_labels_kernel<<<full_block_per_grid, block_size>>>(query_labels.data_handle(),  
-            normalized_query_labels.data_handle(), n_queries, coeff, shift_val, global_min, global_max);
+        // Call denormalize_labels_kernel
+        denormalize_labels_kernel<<<full_block_per_grid, block_size>>>(
+            query_labels.data_handle(),           // Input raw query labels
+            n_queries,                            // Number of queries
+            shift_val_dev,                        // Device pointer for shift values
+            map_types_dev,                        // Device pointer for map types
+            ranges_map_dev,                       // Device pointer for interval map
+            f_config.l,                           // Length of intervals
+            denormalized_query_labels.data_handle() // Output to denormalized_query_labels
+        );
+
+        // Call normalize_ranges_labels_kernel to replace normalize_labels_kernel
+        normalize_ranges_labels_kernel<<<full_block_per_grid, block_size>>>(
+            normalized_query_labels.data_handle(),            // Output to normalized_data_labels
+            n_queries,                                       // Number of data points
+            global_min_dev,                                  // Global minimum value
+            global_max_dev,                                  // Global maximum value
+            denormalized_query_labels.data_handle(),         // Device pointer for ranges map
+            f_config.l                                       // Length of intervals
+        );
     }
+
+    cudaDeviceSynchronize();
+    auto denormalized_query_labels_ptr = denormalized_query_labels.data_handle();
+    auto normalized_query_labels_ptr = normalized_query_labels.data_handle();
+    auto normalized_data_labels_ptr = normalized_data_labels.data_handle();
 }
 
 // calculate similarity between batched datas and queries

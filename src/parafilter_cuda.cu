@@ -201,8 +201,9 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                           size_t n_clusters,
                           uint32_t* exps,
                           int topk,
-                          float global_min,
-                          float global_max,
+                          float* global_min,
+                          float* global_max,
+                          const filter_config &f_config, 
                           float merge_rate = 0.035, 
                           bool run_build = true) 
 {
@@ -219,7 +220,7 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
         centers = parafilter_mmr::make_device_matrix_view<float, uint64_t>(pq_dim, n_clusters * pq_len);
         parafilterPerfLogWraper(parafilter_build(dev_resources, dataset, pq_dim, pq_len, n_clusters, codebook, centers), build_time);
     }
-    
+
     bool is_data_changed = false;
     if (run_build) is_data_changed = true;
     auto normalized_query_labels = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, l);
@@ -240,6 +241,7 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                     ranges, 
                     global_min, 
                     global_max, 
+                    f_config, 
                     true, 
                     is_data_changed
                 ), 
@@ -278,7 +280,8 @@ void calc_mem_predictor_coeff(raft::device_resources const& dev_resources,
                               size_t n_clusters, 
                               uint32_t* exps,
                               int topk, 
-                              double* coeff) 
+                              double* coeff, 
+                              const filter_config &f_config) 
 {
   // run fake ness 4 times, to solve the linear equation :
   // size = a * n_data + b * n_queries + c * n_data * n_queries + d
@@ -306,10 +309,12 @@ void calc_mem_predictor_coeff(raft::device_resources const& dev_resources,
   raft::device_matrix_view<uint64_t, uint64_t> selected_indices_fake{}; \
   raft::device_matrix_view<float, uint64_t> selected_distance_fake{}; 
 
+  std::vector<float> null_global(l, 0);
+
   #define call_fake_run \
     parafilter_build_run(dev_resources, queries_fake, dataset_fake, \ 
                           data_labels_fake, query_labels_fake, selected_distance_fake, \ 
-                          selected_indices_fake, pq_dim, n_clusters, exps, topk, 0, 0); 
+                          selected_indices_fake, pq_dim, n_clusters, exps, topk, null_global.data(), null_global.data(), f_config); 
   
   #define call_calc_fake_matrix_size \
       parafilter_calc_input_size_map(input_size_map, pq_dim, n_dim, l, fake_data_cnt, fake_query_cnt, n_clusters, topk);
@@ -373,41 +378,6 @@ void calc_mem_predictor_coeff(raft::device_resources const& dev_resources,
     coeff[i] = mat[i][4];
 }
 
-void process_compute_filter_config(
-    const filter_config& config,
-    std::vector<float>& shift_differences,
-    std::vector<std::vector<float>>& map_intervals_len) 
-{
-  if (config.shift_val.size() != 2 * config.l) {
-    throw std::invalid_argument("shift_val size must be 2 * l");
-  }
-
-  shift_differences.clear();
-  for (size_t i = 0; i < config.l; ++i) {
-    float left = config.shift_val[i * 2];
-    float right = config.shift_val[i * 2 + 1];
-    shift_differences.push_back(std::abs(right - left));
-  }
-
-  interval_interpolations.clear();
-  for (const auto& intervals : config.interval_map) {
-    if (interval.size() < 2) {
-      throw std::invalid_argument("Each interval in interval_map must have at least two elements");
-    }
-
-    std::vector<float> invervals_len;
-    size_t n_points = intervals.size() / 2;
-
-    std::vector<float> interpolated_values;
-    for (size_t j = 0; j < n_points; ++j) {
-      float l = intervals[j * 2];
-      float r = intervals[j * 2 + 1];
-      invervals_len.push_back(r - l);
-    }
-    map_intervals_len.push_back(invervals_len);
-  }
-}
-
 void split_task(double* coeff,
                 uint64_t n_data, 
                 uint64_t n_queries,
@@ -462,7 +432,7 @@ void split_task(double* coeff,
   while (n_queries % query_batch_size != 0) query_batch_size--;
 }
 
-void calculate_batch_min_max(const std::string& path, float& global_min, float& global_max, 
+void calculate_batch_min_max(const std::string& path, std::vector<float> &global_min, std::vector<float> &global_max, 
                              size_t l, size_t n_data, size_t n_queries) 
 {
     size_t data_offset = 0, query_offset = 0;
@@ -470,13 +440,15 @@ void calculate_batch_min_max(const std::string& path, float& global_min, float& 
     std::string train_file_path = path + "train_label";
     std::string test_file_path = path + "test_label";
 
-    global_min = std::numeric_limits<float>::max();
-    global_max = std::numeric_limits<float>::lowest();
+    for (int i = 0; i < l; i++) {
+      global_min[i] = std::numeric_limits<float>::max();
+      global_max[i] = std::numeric_limits<float>::lowest();
+    }
 
     uint64_t data_batch_size = 0, query_batch_size = 0;
     double coeff[4];
-    coeff[0] = sizeof(float) * 2;
-    coeff[1] = sizeof(float) * 2;
+    coeff[0] = sizeof(float) * 2 * l;
+    coeff[1] = sizeof(float) * 2 * l;
     coeff[2] = 0;
     coeff[3] = 0;
 
@@ -511,8 +483,8 @@ void calculate_batch_min_max(const std::string& path, float& global_min, float& 
         }
 
         for (size_t i = 0; i < l; ++i) {
-            global_min = std::min(global_min, row_min_host[i]);
-            global_max = std::max(global_max, row_max_host[i]);
+            global_min[i] = std::min(global_min[i], row_min_host[i]);
+            global_max[i] = std::max(global_max[i], row_max_host[i]);
         }
 
         cudaFree(data_device);
@@ -550,8 +522,8 @@ void calculate_batch_min_max(const std::string& path, float& global_min, float& 
         }
 
         for (size_t i = 0; i < l; ++i) {
-            global_min = std::min(global_min, row_min_host[i]);
-            global_max = std::max(global_max, row_max_host[i]);
+            global_min[i] = std::min(global_min[i], row_min_host[i]);
+            global_max[i] = std::max(global_max[i], row_max_host[i]);
         }
 
         cudaFree(data_device);
@@ -704,6 +676,8 @@ int main()
   std::map<std::string, std::string> types;
   get_data_type_list(types, std::string(dataset_path + "dtypes").c_str(), keys);
 
+  filter_config f_config("filter.conf");
+
   if (p_config->break_down) break_down = true;
   std::map<std::string, std::pair<int32_t, int32_t>> size_map;
 
@@ -731,13 +705,13 @@ int main()
     rmm::mr::set_current_device_resource(&pool_mr);
     
     calc_mem_predictor_coeff(dev_resources, pq_dim, n_dim, l, tot_samples, 
-            tot_queries, n_clusters, exps, topk, coeff);
+            tot_queries, n_clusters, exps, topk, coeff, f_config);
     write_coeff_to_binary("coeff", coeff);
     return 0;
   }
   read_coeff_from_binary("coeff", coeff);
 
-  float global_min, global_max;
+  std::vector<float> global_min(l), global_max(l);
   calculate_batch_min_max(p_config->path, global_min, global_max, l, tot_samples, tot_queries);
   
   int device_count;
@@ -810,7 +784,7 @@ int main()
         bool run_build = query_batch_offset == 0 ? true : false;
         parafilter_build_run(dev_resources, queries, dataset,  
                           data_labels, query_labels, selected_distance, selected_indices,
-                          pq_dim, n_clusters, exps, topk, global_min, global_max, merge_rate, run_build);
+                          pq_dim, n_clusters, exps, topk, global_min.data(), global_max.data(), f_config, merge_rate, run_build);
 
         cudaEventRecord(compute_done_event[cur_res_buff_offset]);  
         flush_current_res(selected_distance.data_handle(), selected_indices.data_handle(), inter_buffer_size, 

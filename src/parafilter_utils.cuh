@@ -102,6 +102,7 @@ bool isInteger(const std::string& str) {
   }
   return i > 0;
 }
+
 inline
 std::string remove_spaces(const std::string& str) {
   std::string result;
@@ -112,6 +113,7 @@ std::string remove_spaces(const std::string& str) {
   }
   return result;
 }
+
 template <typename T>
 std::vector<T> parse_array(const std::string& str) {
   std::vector<T> result;
@@ -213,10 +215,10 @@ struct parafilter_config {
 
 class filter_config {
 public:
-  int l;  
-  std::vector<int> filter_type;  
-  std::vector<std::vector<float>> shift_val;  
-  std::vector<std::vector<int>> interval_map; 
+  int l;
+  std::vector<int> filter_type;
+  std::vector<float> shift_val;
+  std::vector<std::vector<int>> interval_map;
 
   filter_config(const std::string& filename) {
     std::ifstream file(filename);
@@ -226,30 +228,37 @@ public:
 
     std::string line;
     while (std::getline(file, line)) {
-      line = removes_paces(line);
+      line = remove_spaces(line);
 
       if (line.empty() || line[0] == '#') {
-        continue; 
+          continue;
       }
 
       if (line.find("l=") == 0) {
-        l = std::stoi(line.substr(2));
-        filter_type.resize(l);
-        shift_val.resize(l);
-        interval_map.resize(l);
-      } else if (line.find("filter") == 0) {
+          l = std::stoi(line.substr(2));
+          filter_type.resize(l);
+          shift_val.resize(2 * l);
+          interval_map.resize(l);
+      }
+      else if (line.find("filter") == 0) {
         int filter_index = std::stoi(line.substr(6));
 
         while (std::getline(file, line)) {
           line = remove_spaces(line);
-          if (line.empty()) break; 
+          if (line.empty()) break;
 
           if (line.find("type=") == 0) {
             filter_type[filter_index] = std::stoi(line.substr(5));
-          } else if (line.find("shift_val=") == 0) {
-            shift_val[filter_index] = parse_array<float>(line.substr(10));
-          } else if (line.find("interval_map=") == 0) {
+          }
+          else if (line.find("shift_val=") == 0) {
+            std::vector<float> interval = parse_array<float>(line.substr(10));
+            shift_val[2 * filter_index] = interval[0];
+            shift_val[2 * filter_index + 1] = interval[1];
+            break;
+          }
+          else if (line.find("interval_map=") == 0) {
             interval_map[filter_index] = parse_array<int>(line.substr(13));
+            break;
           }
         }
       }
@@ -262,22 +271,51 @@ public:
       std::cout << "Filter " << i << ":" << std::endl;
       std::cout << "  Type: " << filter_type[i] << std::endl;
       std::cout << "  Shift Values: ";
-      for (float val : shift_val[i]) {
-        std::cout << val << " ";
-      }
+      std::cout << shift_val[2 * i] << " " << shift_val[2 * i + 1] << " ";
+
       std::cout << std::endl;
 
       std::cout << "  Interval Map: ";
       for (int val : interval_map[i]) {
-        std::cout << val << " ";
+          std::cout << val << " ";
       }
       std::cout << std::endl;
     }
   }
 
 private:
-  
+
 };
+
+void process_filter_config(
+    const filter_config& config,
+    std::vector<float>& shift_len,
+    std::vector<std::vector<float>>& maps_len) 
+{
+  if (config.shift_val.size() != 2 * config.l) {
+    throw std::invalid_argument("shift_val size must be 2 * l");
+  }
+
+  shift_len.clear();
+  for (size_t i = 0; i < config.l; ++i) {
+    float left = config.shift_val[i * 2];
+    float right = config.shift_val[i * 2 + 1];
+    shift_len.push_back(std::abs(right + left));
+  }
+
+  maps_len.clear();
+  for (const auto& intervals : config.interval_map) {
+    std::vector<float> invervals_len;
+    size_t n_points = intervals.size() / 2;
+
+    for (size_t j = 0; j < n_points; ++j) {
+      float l = intervals[j * 2];
+      float r = intervals[j * 2 + 1];
+      invervals_len.push_back(r - l);
+    }
+    maps_len.push_back(invervals_len);
+  }
+}
 
 class Timer {
   public:
