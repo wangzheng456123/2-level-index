@@ -155,6 +155,7 @@ struct parafilter_config {
   uint64_t enable_multi_gpu;
   uint64_t mem_bound;
   uint64_t is_calc_mem_predictor_coeff;
+  uint64_t lowest_query_batch;
   float merge_rate;
 
   std::string dataset;
@@ -380,6 +381,29 @@ int gauss(ElementType a[][5], IndexType n = 4)
             a[i][n]-=a[j][n]*a[i][j];
     return 0;
 }
+
+int findMaxFactor(uint64_t a, uint64_t b) {
+    if (b <= a) {
+        return b; 
+    }
+
+    int maxFactor = 1;
+
+    for (int i = 1; i <= sqrt(b); ++i) {
+        if (b % i == 0) {
+            if (i < a) {
+                maxFactor = max(maxFactor, i);
+            }
+            int pairFactor = b / i;
+            if (pairFactor < a) {
+                maxFactor = max(maxFactor, pairFactor);
+            }
+        }
+    }
+
+    return maxFactor;
+}
+
 
 //fixme: fake run use macro is not simple to control the, 
 //call in any levels, try to find better way 
@@ -968,4 +992,5 @@ std::map<std::string, int> parafilter_config::str_to_offset_map = { \
       {"MEM_BOUND", offsetof(parafilter_config, mem_bound)}, \
       {"IS_CALC_MEM_PREDICTOR_COEFF", offsetof(parafilter_config, is_calc_mem_predictor_coeff)}, \
       {"MERGE_RATE", offsetof(parafilter_config, merge_rate)}, \
+      {"LOWEST_QUERY_BATCH", offsetof(parafilter_config, lowest_query_batch)}, \
 };

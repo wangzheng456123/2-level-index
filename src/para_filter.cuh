@@ -511,7 +511,8 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
                                  ElementType* global_max,
                                  const filter_config& f_config, 
                                  bool is_query_changed = true,
-                                 bool is_data_changed = true
+                                 bool is_data_changed = true, 
+                                 bool reconfig = false
                                  ) 
 {
     IndexType n_data = normalized_data_labels.extent(0);
@@ -529,7 +530,7 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
     thread_local ElementType* global_min_dev = nullptr;
     thread_local ElementType* global_max_dev = nullptr;
 
-    if (!is_configed_dev) {
+    if (!is_configed_dev || reconfig) {
         auto trans_vec_to_device = [](void*& dev_ptr, const void* src, size_t size) {
             dev_ptr = parafilter_mmr::mem_allocator(size);
             cudaMemcpy(dev_ptr, src, size, cudaMemcpyHostToDevice);
@@ -763,14 +764,18 @@ void merge_intermediate_result(raft::device_resources const& dev_resources,
                                IndexType n_queries, 
                                int topk, 
                                IndexType start_offset, 
+                               int device_id,
                                raft::device_matrix_view<ElementType, IndexType> merged_dis_view, 
                                raft::device_matrix_view<IndexType, IndexType> merged_idx_view) 
 {
     std::vector<std::vector<ElementType>> dis_matrices;
     std::vector<std::vector<IndexType>> idx_matrices;
 
-    read_matrices_from_file(file_path, n_queries, topk, batch_size, dis_matrices);
-    read_matrices_from_file(file_path, n_queries, topk, batch_size, idx_matrices);
+    std::string dis_file_path = file_path + "distances_" + std::to_string(device_id);
+    std::string neigh_file_path = file_path + "neighbors_" + std::to_string(device_id);
+
+    read_matrices_from_file(dis_file_path, n_queries, topk, batch_size, dis_matrices);
+    read_matrices_from_file(neigh_file_path, n_queries, topk, batch_size, idx_matrices);
 
     auto dis_view = parafilter_mmr::make_device_matrix_view<ElementType, IndexType>(n_queries, topk * batch_size);
     auto idx_view = parafilter_mmr::make_device_matrix_view<IndexType, IndexType>(n_queries, topk * batch_size);
