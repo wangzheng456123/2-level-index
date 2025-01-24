@@ -464,7 +464,7 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
                                  bool is_query_changed = true,
                                  bool is_data_changed = true, 
                                  ElementType left = 0, 
-                                 ElementType right = 3 * 24 * 3600) 
+                                 ElementType right = 0) 
 {
     IndexType n_data = normalized_data_labels.extent(0);
     IndexType n_queries = normalized_query_labels.extent(0);

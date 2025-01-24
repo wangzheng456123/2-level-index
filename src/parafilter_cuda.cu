@@ -732,9 +732,9 @@ int main()
     uint64_t inter_buffer_size = topk * query_batch_size;
     // todo: ping pang the output buffer to increase throughput
     float* selected_distance_device_ptr;
-    selected_distance_device_ptr = (float *)parafilter_mmr::mem_allocator(SWAP_BUFF_COUNT * inter_buffer_size * sizeof(float));
+    cudaMalloc((void**)&selected_distance_device_ptr, SWAP_BUFF_COUNT  * inter_buffer_size * sizeof(float));
     uint64_t* selected_indices_device_ptr;
-    selected_indices_device_ptr = (uint64_t *)parafilter_mmr::mem_allocator(SWAP_BUFF_COUNT * inter_buffer_size * sizeof(uint64_t));
+    cudaMalloc((void**)&selected_indices_device_ptr, SWAP_BUFF_COUNT * inter_buffer_size * sizeof(uint64_t));
 
     raft::device_matrix_view<float, uint64_t> selected_distance{};
     raft::device_matrix_view<uint64_t, uint64_t> selected_indices{};
