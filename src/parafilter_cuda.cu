@@ -766,6 +766,27 @@ int main()
     }
     std::map<std::string, void*> data_map;
     int cur_res_buff_offset = 0;
+    if (data_batch_size != tot_samples) {
+      uint64_t batch_size = (tot_samples + data_batch_size - 1) / data_batch_size;
+      auto merged_dis_view = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, topk);
+      auto merged_idx_view = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk);
+
+      merge_intermediate_result<float, uint64_t>(
+                                dev_resources,
+                                "res/", 
+                                batch_size, 
+                                data_batch_size, 
+                                n_queries, 
+                                topk, 
+                                0l, 
+                                i, 
+                                merged_dis_view, 
+                                merged_idx_view);
+      flush_current_res(merged_dis_view.data_handle(), merged_idx_view.data_handle(), 
+                          0, dis_copy_done_event[0], idx_copy_done_event[0], compute_done_event[0], 
+                          i, "./res/", true);
+    } 
+
     for (uint64_t data_batch_offset = 0; data_batch_offset < tot_samples; data_batch_offset += data_batch_size) {
       uint64_t cur_data_batch_size;
       cur_data_batch_size = data_batch_size;
@@ -813,15 +834,15 @@ int main()
                       i, "./res/", true);
     if (data_batch_size != tot_samples) {
       uint64_t batch_size = (tot_samples + data_batch_size - 1) / data_batch_size;
-      auto merged_dis_view = parafilter_mmr::make_device_matrix_view<float, uint64_t>(tot_queries * batch_size, topk);
-      auto merged_idx_view = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(tot_queries * batch_size, topk);
+      auto merged_dis_view = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, topk);
+      auto merged_idx_view = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk);
 
       merge_intermediate_result<float, uint64_t>(
                                 dev_resources,
                                 "res/", 
                                 batch_size, 
                                 data_batch_size, 
-                                tot_queries, 
+                                n_queries, 
                                 topk, 
                                 0l, 
                                 i, 
