@@ -288,6 +288,60 @@ private:
 
 };
 
+template <typename T>
+void write_device_matrix_to_file(T* device_matrix_ptr,  // Pointer to device or host matrix
+                                 uint64_t n_rows, uint64_t n_cols, 
+                                 const std::string& path, const std::string& prefix,
+                                 bool is_device = true)  // is_device flag to indicate if data is on device
+{
+    // Allocate memory for the host matrix
+    std::vector<T> host_matrix(n_rows * n_cols);
+
+    // If the data is on the device, copy it to the host
+    if (is_device) {
+        cudaMemcpy(host_matrix.data(), device_matrix_ptr, n_rows * n_cols * sizeof(T), cudaMemcpyDeviceToHost);
+    } else {
+        // If the data is already on the host, just use it
+        std::memcpy(host_matrix.data(), device_matrix_ptr, n_rows * n_cols * sizeof(T));
+    }
+
+    // Find the next available file number
+    int file_number = 0;
+    std::ostringstream filename;
+
+    // Check for existing files with the same prefix
+    while (true) {
+        filename.str("");  // Reset the string stream
+        filename << path << "/" << prefix << "-" << std::setw(4) << std::setfill('0') << file_number << ".bin";  // File format: path/prefix_0000.bin
+        
+        // Check if the file already exists
+        if (!std::filesystem::exists(filename.str())) {
+            // If the file does not exist, break the loop
+            break;
+        }
+
+        // Otherwise, increment the file number
+        file_number++;
+    }
+
+    // Create a binary file with the generated filename
+    std::ofstream out_file(filename.str(), std::ios::binary);
+    if (!out_file) {
+        std::cerr << "Error: Could not open file for writing: " << filename.str() << std::endl;
+        return;
+    }
+
+    // Write the matrix data to the binary file
+    out_file.write(reinterpret_cast<char*>(host_matrix.data()), n_rows * n_cols * sizeof(T));
+    
+    if (!out_file) {
+        std::cerr << "Error: Writing to file failed: " << filename.str() << std::endl;
+        return;
+    }
+
+    std::cout << "Matrix written to file: " << filename.str() << std::endl;
+}
+
 void process_filter_config(
     const filter_config& config,
     std::vector<float>& shift_len,

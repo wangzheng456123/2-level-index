@@ -4,6 +4,8 @@
 #include <set>
 #include <unordered_set>
 
+#define INVALID_IDX 12345678910ll
+
 template<typename ElementType, typename IndexType>
 ElementType* copy_matrix_to_host(raft::device_matrix_view<ElementType, IndexType> dev_matrix) 
 {
@@ -56,27 +58,50 @@ bool sample_verification(ElementType *ground_truth,
     delete [] host_res;
 }
 
-inline uint64_t read_neighbors_file(const std::string& file_path, std::vector<uint64_t>& neighbors) 
+inline uint64_t read_neighbors_file(const std::string& file_path, std::vector<uint64_t>& neighbors, std::streampos offset, size_t size) 
 {
     uint64_t valid_cnt = 0;
     std::ifstream neighbors_in(file_path, std::ios::binary);
+    
+    // Check if file can be opened
     if (!neighbors_in) {
         std::cerr << "Error: Unable to open ground truth neighbors file: " << file_path << std::endl;
         std::exit(EXIT_FAILURE);
     }
 
-    int neighbor;
-    while (neighbors_in.read(reinterpret_cast<char*>(&neighbor), sizeof(int))) {
+    // Seek to the given offset in the file
+    neighbors_in.seekg(offset);
+    if (!neighbors_in.good()) {
+        std::cerr << "Error: Unable to seek to offset " << offset << " in file: " << file_path << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+
+    // Read the given size of data
+    char* buffer = new char[size];
+    neighbors_in.read(buffer, size);
+    if (!neighbors_in) {
+        std::cerr << "Error: Unable to read the required size from the file: " << file_path << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+
+    // Process the data, assuming each element is an int (4 bytes)
+    size_t num_elements = size / sizeof(int); // Assuming the data is of type int
+    for (size_t i = 0; i < num_elements; i++) {
+        int neighbor = reinterpret_cast<int*>(buffer)[i];
+
         // Only store valid neighbors (>= 0)
         if (neighbor >= 0) {
-            neighbors.push_back(neighbor);
+            neighbors[i] = neighbor;
             valid_cnt++;
-        }
-        else {
-            // fixme: use other magic for very large dataset
-            neighbors.push_back(12345678910ll);
+        } else {
+            // Handle invalid neighbors (use a predefined value for large datasets)
+            neighbors[i] = INVALID_IDX;
         }
     }
+
+    // Clean up buffer
+    delete[] buffer;
+
     neighbors_in.close();
     return valid_cnt;
 }
@@ -91,7 +116,7 @@ float compute_recall(const std::string& res_directory_path, const std::string& g
 
     // Step 2: Load ground truth neighbors
     std::vector<uint64_t> neighbors;  // To store the ground truth neighbors
-    uint64_t total_valid = read_neighbors_file(ground_truth_path, neighbors);
+    uint64_t total_valid = read_neighbors_file(ground_truth_path, neighbors, 0, sizeof(int) * topk * n_queries);
     uint64_t total_hits = 0;   // To store the total number of hits
 
     // Step 3: Ensure res_neighbors and neighbors are properly sized
@@ -202,3 +227,62 @@ void generate_lut_build_verify_data(size_t pq_len, size_t n_clusters, size_t pq_
     cudaMemcpy(*d_centers, h_centers.data(), centers_size * sizeof(FloatType), cudaMemcpyHostToDevice);
     cudaMemcpy(*d_queries, h_queries.data(), queries_size * sizeof(FloatType), cudaMemcpyHostToDevice);
 }
+
+// Kernel to compute the L2 distance between queries and the selected dataset indices
+__global__ void compute_l2_distances_kernel(
+    const uint64_t* selected_indices_ptr, 
+    const float* dataset_ptr, 
+    const float* queries_ptr, 
+    float* distances_ptr, 
+    uint64_t n_queries, 
+    uint64_t n_candi, 
+    uint64_t n_dims)
+{
+    int query_idx = blockIdx.x * blockDim.x + threadIdx.x;  // Query index (rows of queries)
+    int cand_idx = blockIdx.y * blockDim.y + threadIdx.y;   // Candidate index (columns of selected indices)
+
+    if (query_idx < n_queries && cand_idx < n_candi) {
+        uint64_t dataset_idx = selected_indices_ptr[query_idx * n_candi + cand_idx];  // Get the index from selected indices
+
+        // Compute L2 distance
+        float dist = 0.0f;
+        for (uint64_t d = 0; d < n_dims; ++d) {
+            float diff = dataset_ptr[dataset_idx * n_dims + d] - queries_ptr[query_idx * n_dims + d];
+            dist += diff * diff;
+        }
+
+        distances_ptr[query_idx * n_candi + cand_idx] = sqrtf(dist);  // Store the computed distance
+    }
+}
+
+void compute_refine_distances(
+    raft::device_matrix_view<uint64_t, uint64_t> selected_indices_view, 
+    raft::device_matrix_view<float, uint64_t> dataset_view, 
+    raft::device_matrix_view<float, uint64_t> queries_view, 
+    raft::device_matrix_view<float, uint64_t> distances_view)
+{
+    // Get matrix dimensions
+    uint64_t n_queries = queries_view.extent(0); // Number of queries
+    uint64_t n_candi = selected_indices_view.extent(1); // Number of candidates
+    uint64_t n_dims = dataset_view.extent(1); // Number of dimensions (both dataset and queries have this)
+
+    // We will need a kernel to calculate the distances. Let us prepare the GPU kernel.
+    // Kernel to calculate L2 distance between queries and dataset
+    auto selected_indices_ptr = selected_indices_view.data_handle();
+    auto dataset_ptr = dataset_view.data_handle();
+    auto queries_ptr = queries_view.data_handle();
+    auto distances_ptr = distances_view.data_handle();
+
+    // Compute L2 distances between queries and selected dataset entries
+    dim3 block_size(16, 16);
+    dim3 grid_size((n_queries + block_size.x - 1) / block_size.x, 
+                   (n_candi + block_size.y - 1) / block_size.y);
+
+    compute_l2_distances_kernel<<<grid_size, block_size>>>(
+        selected_indices_ptr, dataset_ptr, queries_ptr, distances_ptr, 
+        n_queries, n_candi, n_dims
+    );
+    
+    cudaDeviceSynchronize();
+}
+

@@ -117,7 +117,10 @@ void parafilter_query(raft::device_resources const& dev_resources,
                       int pq_dim, 
                       int pq_len, 
                       int topk, 
-                      float merge_rate) 
+                      float merge_rate,
+                      bool is_debug_recall = false,  
+                      std::string ground_truth_path = "./", 
+                      uint64_t query_offset = 0) 
 {    
   int n_data = dataset.extent(0);
   int n_queries = queries.extent(0);
@@ -136,7 +139,6 @@ void parafilter_query(raft::device_resources const& dev_resources,
   raft::distance::pairwise_distance(dev_resources, 
           normalized_query_labels, normalized_data_labels, label_dis, metric);
 
-  auto label_dis_ptr = label_dis.data_handle();
   // sum distance of vectors and lebels
   auto dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, n_data);
   matrix_add_with_weights<float, uint64_t>(dev_resources, vec_dis, label_dis, dis, 1.f, merge_rate);
@@ -144,20 +146,48 @@ void parafilter_query(raft::device_resources const& dev_resources,
   auto first_candi_labels = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, topk * exps[0] * l);
   auto first_val = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, topk * exps[0]);
   auto first_idx = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk * exps[0]);
+  auto first_label_dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, topk * exps[0]);
 
   raft::matrix::select_k<float, uint64_t>(dev_resources, dis, std::nullopt, first_val, first_idx, true, true);
   select_elements<float, uint64_t>(dev_resources, data_labels, first_idx, first_candi_labels);
   select_elements<float, uint64_t>(dev_resources, vec_dis, first_idx, first_val, false);
+  select_elements<float, uint64_t>(dev_resources, label_dis, first_idx, first_label_dis, false);
 
-  cudaDeviceSynchronize();
-  compute_matches_on_cpu(first_idx.data_handle(), first_idx.extent(0), first_idx.extent(1), );
+  size_t byte_size = 0;
+  if (is_debug_recall) {
+    byte_size = n_queries * sizeof(int) * topk;
+  }
+  if (is_debug_recall) {
+    cudaDeviceSynchronize();
+
+    auto candi_dis_view = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, topk * exps[0]);
+    compute_refine_distances(first_idx, dataset, queries, candi_dis_view);
+
+    std::string out_path = "tmp_data";
+
+    #define write_matrix_view(matrix_view, is_device) \
+    write_device_matrix_to_file(                   \
+        matrix_view.data_handle(),                  \
+        matrix_view.extent(0),                      \
+        matrix_view.extent(1),                      \
+        out_path,                                   \
+        #matrix_view,                              \
+        is_device                                   \
+    )
+
+    write_matrix_view(first_label_dis, true);
+    write_matrix_view(first_val, true);
+    write_matrix_view(candi_dis_view, true);
+    write_matrix_view(first_idx, true);
+    write_matrix_view(first_candi_labels, true);
+    
+  }
 
   auto second_indices = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk * exps[1]);
   filter_candi_by_labels(dev_resources, first_candi_labels, ranges, first_val, topk * exps[1], second_indices);
 
   auto second_indices_direct = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk * exps[1]);
   select_elements<uint64_t, uint64_t>(dev_resources, first_idx, second_indices, second_indices_direct, false);
-  auto second_indices_direct_ptr = second_indices_direct.data_handle();
 
   refine<float, uint64_t>(
          dev_resources, 
@@ -209,7 +239,10 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                           const filter_config &f_config, 
                           float merge_rate = 0.035, 
                           bool run_build = true, 
-                          bool reconfig = false) 
+                          bool reconfig = false, 
+                          bool is_debug_recall = false, 
+                          std::string ground_truth_path = "./", 
+                          uint64_t query_offset = 0) 
 {
     size_t n_data = dataset.extent(0);
     size_t n_queries = queries.extent(0);
@@ -270,7 +303,10 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                      pq_dim, 
                      pq_len, 
                      topk, 
-                     merge_rate
+                     merge_rate, 
+                     is_debug_recall, 
+                     ground_truth_path, 
+                     query_offset
                   ), 
                      query_time
     );
@@ -805,7 +841,8 @@ int main()
         bool run_build = query_batch_offset == 0 ? true : false;
         parafilter_build_run(dev_resources, queries, dataset,  
                           data_labels, query_labels, selected_distance, selected_indices,
-                          pq_dim, n_clusters, exps, topk, global_min.data(), global_max.data(), f_config, merge_rate, run_build);
+                          pq_dim, n_clusters, exps, topk, global_min.data(), global_max.data(), f_config, merge_rate, run_build, 
+                          false, true, std::string(dataset_path + "neighbors"), query_batch_offset * topk * sizeof(int));
 
         cudaEventRecord(compute_done_event[cur_res_buff_offset]);  
         flush_current_res(selected_distance.data_handle(), selected_indices.data_handle(), inter_buffer_size, 

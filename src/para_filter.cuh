@@ -166,7 +166,7 @@ __global__ void normalize_ranges_labels_kernel(float* normalized_data_labels,
         float right = ranges[idx * 2 + 1];
         float midpoint = (left + right) / 2.0f;
         float coeff = 2.f / (right - left);
-        coeff = 2.f / (global_max[i] - global_min[i]);
+        // coeff = 2.f / (global_max[i] - global_min[i]);
         normalized_data_labels[idx] = (midpoint - global_min[i]) * coeff;
     }
 }
@@ -190,7 +190,7 @@ __global__ void normalize_data_labels_kernel(const float* data, uint64_t n_data,
             coeff = 2.f / maps_len[val];
         }
 
-        coeff = 2.f / (global_max[i] - global_min[i]);
+        // coeff = 2.f / (global_max[i] - global_min[i]);
         out[idx] = (data[idx] - global_min[i]) * coeff;
     }
 }
