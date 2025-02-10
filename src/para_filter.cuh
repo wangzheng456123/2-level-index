@@ -98,6 +98,32 @@ __global__ void filter_by_constrain_kernel(float* dis, const float* constrains,
     if (ans == 0) dis[idx] = std::numeric_limits<float>::max(); 
 }
 
+/**/
+__global__ void calculate_filter_dis_kernel(float* dis, const float* constrains, 
+                                            const float* data_labels, uint64_t l, uint64_t n_queries, uint64_t n_data) 
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= n_queries || y >= n_data) return ;
+    int ans = 1;
+
+    for (int i = 0; i < l; i++) {
+        float li = constrains[x * l * 2 + i * 2];
+        float ri = constrains[x * l * 2 + i * 2 + 1];
+
+        float label = data_labels[y * l + i];
+
+        if (label < li || label > ri) {
+            ans = 0;
+        }
+    }
+
+    uint64_t idx = x * n_data + y;
+    if (ans == 0) dis[idx] = 1e6;
+    else dis[idx] = 0;  
+}
+
 // fixme: this kernel currently unused, but it may useful future because its satisify pseudocode in paper
 __global__ void normalize_constrains_kernel(const float* constrains, int l, int n_cons, float* res) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -833,4 +859,21 @@ void slice(raft::resources const& handle,
                       coords.row2,
                       coords.col2,
                       true);
+}
+
+void calc_pairwise_filter_dis(raft::device_matrix_view<float, uint64_t> const &data_labels, 
+                              raft::device_matrix_view<float, uint64_t> const &constrains, 
+                              raft::device_matrix_view<float, uint64_t> filter_dis) 
+{
+    uint64_t n_data = data_labels.extent(0);
+    uint64_t l = data_labels.extent(1);
+
+    uint64_t n_queries = constrains.extent(0);
+
+    dim3 thread_block_size(16, 16);
+    dim3 grid_block_size((n_queries + thread_block_size.x - 1) / thread_block_size.x, 
+                (n_data + thread_block_size.y) / thread_block_size.y);
+
+    calculate_filter_dis_kernel<<<grid_block_size, thread_block_size>>>(filter_dis.data_handle(), 
+            constrains.data_handle(), data_labels.data_handle(), l, n_queries, n_data);
 }
