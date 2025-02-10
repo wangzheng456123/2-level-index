@@ -133,10 +133,10 @@ void parafilter_query(raft::device_resources const& dev_resources,
   // calculated distance between data lables and normalized constrains
   auto metric = raft::distance::DistanceType::L2Expanded;
 
-  raft::distance::pairwise_distance(dev_resources, 
-          normalized_query_labels, normalized_data_labels, label_dis, metric);
+  // raft::distance::pairwise_distance(dev_resources, 
+  //        normalized_query_labels, normalized_data_labels, label_dis, metric);
 
-  auto label_dis_ptr = label_dis.data_handle();
+  calc_pairwise_filter_dis(data_labels, ranges, label_dis);
   // sum distance of vectors and lebels
   auto dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, n_data);
   matrix_add_with_weights<float, uint64_t>(dev_resources, vec_dis, label_dis, dis, 1.f, merge_rate);
