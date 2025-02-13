@@ -608,7 +608,8 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
 
     // todo fuse the 3 kernel calls to 1
     if (is_data_changed) {
-         // Call normalize_data_labels_kernel to replace normalize_labels_kernel
+        // Call normalize_data_labels_kernel to replace normalize_labels_kernel
+        /*
         normalize_data_labels_kernel<<<full_block_per_grid, block_size>>>(
             data_labels.data_handle(),            // Input data labels
             n_data,                               // Number of queries
@@ -620,7 +621,7 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
             global_max_dev,                       // Global maximum value
             f_config.l,                           // Length of intervals
             normalized_data_labels.data_handle()  // Output to normalized_data_labels
-        );
+        );*/
     }
 
     if (is_query_changed) {
@@ -641,16 +642,18 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
 
         // Call normalize_ranges_labels_kernel to replace normalize_labels_kernel
         normalize_ranges_labels_kernel<<<full_block_per_grid, block_size>>>(
-            normalized_query_labels.data_handle(),            // Output to normalized_data_labels
+            normalized_query_labels.data_handle(),           // Output to normalized_data_labels
             n_queries,                                       // Number of data points
             global_min_dev,                                  // Global minimum value
             global_max_dev,                                  // Global maximum value
-            denormalized_query_labels.data_handle(),         // Device pointer for ranges map
+            denormalized_query_labels.data_handle(),         // Device pointer for ranges
             f_config.l                                       // Length of intervals
         );
     }
 
     cudaDeviceSynchronize();
+
+    auto data_labels_ptr = data_labels.data_handle();
     auto denormalized_query_labels_ptr = denormalized_query_labels.data_handle();
     auto normalized_query_labels_ptr = normalized_query_labels.data_handle();
     auto normalized_data_labels_ptr = normalized_data_labels.data_handle();
@@ -791,9 +794,7 @@ inline void refine(raft::device_resources const& dev_resources,
     auto refine_indices = parafilter_mmr::make_device_matrix_view<IndexType, IndexType>(n_queries, k);
     raft::matrix::select_k<ElementType, IndexType>(dev_resources, refine_dis, std::nullopt, distances, refine_indices, true);
 
-    auto refine_indices_ptr = refine_indices.data_handle();
     select_elements<IndexType, IndexType>(dev_resources, neighbor_candidates, refine_indices, indices, false);
-    auto indices_ptr = indices.data_handle();
     LOG(INFO) << "cur query batch finished";
 }
 
