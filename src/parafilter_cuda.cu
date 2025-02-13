@@ -146,11 +146,9 @@ void parafilter_query(raft::device_resources const& dev_resources,
   auto first_idx = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk * exps[0]);
 
   raft::matrix::select_k<float, uint64_t>(dev_resources, dis, std::nullopt, first_val, first_idx, true, true);
+  
   select_elements<float, uint64_t>(dev_resources, data_labels, first_idx, first_candi_labels);
   select_elements<float, uint64_t>(dev_resources, vec_dis, first_idx, first_val, false);
-
-  cudaDeviceSynchronize();
-  compute_matches_on_cpu(first_idx.data_handle(), first_idx.extent(0), first_idx.extent(1), );
 
   auto second_indices = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk * exps[1]);
   filter_candi_by_labels(dev_resources, first_candi_labels, ranges, first_val, topk * exps[1], second_indices);

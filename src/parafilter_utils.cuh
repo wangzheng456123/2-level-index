@@ -219,6 +219,7 @@ public:
   int l;
   std::vector<int> filter_type;
   std::vector<float> shift_val;
+  std::vector<int> div_value;
   std::vector<std::vector<int>> interval_map;
 
   filter_config(const std::string& filename) {
@@ -240,6 +241,7 @@ public:
           filter_type.resize(l);
           shift_val.resize(2 * l);
           interval_map.resize(l);
+          div_value.resize(l);
       }
       else if (line.find("filter") == 0) {
         int filter_index = std::stoi(line.substr(6));
@@ -259,6 +261,11 @@ public:
           }
           else if (line.find("interval_map=") == 0) {
             interval_map[filter_index] = parse_array<int>(line.substr(13));
+            break;
+          }
+          else if (line.find("div_value=") == 0) {
+            std::vector<int> div = parse_array<int>(line.substr(10));
+            div_value[filter_index] = div[0];
             break;
           }
         }

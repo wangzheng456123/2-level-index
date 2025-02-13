@@ -160,7 +160,8 @@ __global__ void denormalize_labels_kernel(const float* data, uint64_t n_data,
 }*/
 
 __global__ void denormalize_labels_kernel(const float* data, uint64_t n_data,
-    const float* shift_val, const int* map_types, const float* interval_map, uint64_t l, float* out)
+    const float* shift_val, const int* map_types, const float* interval_map, const int* div_values, 
+    uint64_t l, float* out)
 {
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_data) return;
@@ -176,6 +177,11 @@ __global__ void denormalize_labels_kernel(const float* data, uint64_t n_data,
             int val = data[idx] - 1;
             out[idx * 2] = interval_map[2 * val];
             out[idx * 2 + 1] = interval_map[2 * val + 1];
+        }
+        else if (map_types[i] == 2) {
+            int val = data[idx];
+            out[idx * 2] = val / div_values[i];
+            out[idx * 2 + 1] = std::numeric_limits<float>::max();
         }
     }
 }
@@ -198,7 +204,7 @@ __global__ void normalize_ranges_labels_kernel(float* normalized_data_labels,
 }
 
 __global__ void normalize_data_labels_kernel(const float* data, uint64_t n_data,
-    const float* maps_len, const float* shift_len, const int* map_types, float* global_min,
+    const float* maps_len, const float* shift_len, const int* map_types, const int* div_values, float* global_min,
     float* global_max, uint64_t l, float* out)
 {
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -214,6 +220,10 @@ __global__ void normalize_data_labels_kernel(const float* data, uint64_t n_data,
         else if (map_types[i] == 1) {
             int val = data[idx] - 1;
             coeff = 2.f / maps_len[val];
+        }
+        else if (map_types[i] == 1) {
+            float val = data[idx] / div_values[i];
+            coeff = 2.f / (global_max[i] - val);
         }
 
         coeff = 2.f / (global_max[i] - global_min[i]);
@@ -550,6 +560,8 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
     thread_local float* ranges_map_dev = nullptr; 
     thread_local float* shift_len_dev = nullptr;
     thread_local float* maps_len_dev = nullptr;
+    thread_local int* div_value_dev = nullptr;
+
     thread_local int* map_types_dev = nullptr;
     thread_local bool is_configed_dev = false;
 
@@ -583,6 +595,7 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
         }
         trans_vec_to_device(reinterpret_cast<void*&>(maps_len_dev), maps_len_flat.data(), maps_len_flat.size() * sizeof(float));
         trans_vec_to_device(reinterpret_cast<void*&>(map_types_dev), f_config.filter_type.data(), f_config.filter_type.size() * sizeof(int));
+        trans_vec_to_device(reinterpret_cast<void*&>(div_value_dev), f_config.div_value.data(), f_config.div_value.size() * sizeof(int));
 
         trans_vec_to_device(reinterpret_cast<void*&>(global_min_dev), global_min, f_config.l * sizeof(float));
         trans_vec_to_device(reinterpret_cast<void*&>(global_max_dev), global_max, f_config.l * sizeof(float));
@@ -601,7 +614,8 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
             n_data,                               // Number of queries
             maps_len_dev,                         // Device pointer for map lengths
             shift_len_dev,                        // Device pointer for shift lengths
-            map_types_dev,                        // filter types array
+            div_value_dev,                        // Device pointer for div value
+            map_types_dev,                        // filter types array                       
             global_min_dev,                       // Global minimum value
             global_max_dev,                       // Global maximum value
             f_config.l,                           // Length of intervals
@@ -620,6 +634,7 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
             shift_val_dev,                        // Device pointer for shift values
             map_types_dev,                        // Device pointer for map types
             ranges_map_dev,                       // Device pointer for interval map
+            div_value_dev,                        // Device pointer for div value
             f_config.l,                           // Length of intervals
             denormalized_query_labels.data_handle() // Output to denormalized_query_labels
         );
