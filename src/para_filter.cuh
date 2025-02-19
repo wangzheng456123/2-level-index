@@ -380,6 +380,37 @@ __global__ void calc_refine_distance_kernel(const ElementType *candi_vec, const 
     dis[o_idx] = calc_vector_L2_dis_device(candi_vec + candi_idx, queries + query_idx, n_dim);
 }
 
+// Kernel to compute the L2 distance between queries and the selected dataset indices
+__global__ void compute_l2_distances_kernel(
+    const uint64_t* selected_indices_ptr, 
+    const float* dataset_ptr, 
+    const float* queries_ptr, 
+    float* distances_ptr, 
+    uint64_t n_data, 
+    uint64_t n_queries, 
+    uint64_t n_candi, 
+    uint64_t n_dim)
+{
+    int query_idx = blockIdx.x * blockDim.x + threadIdx.x;  // Query index (rows of queries)
+    int cand_idx = blockIdx.y * blockDim.y + threadIdx.y;   // Candidate index (columns of selected indices)
+
+    if (query_idx < n_queries && cand_idx < n_candi) {
+        uint64_t dataset_idx = selected_indices_ptr[query_idx * n_candi + cand_idx];  // Get the index from selected indices
+        // Compute L2 distance
+        float dist = 0.0f;
+        float data_val = std::sqrt(std::numeric_limits<float>::max() / static_cast<uint64_t>(n_dim));
+        for (uint64_t d = 0; d < n_dim; ++d) {
+            if (dataset_idx < n_data) {
+                data_val = dataset_ptr[dataset_idx * n_dim + d];
+            } 
+            float diff = data_val - queries_ptr[query_idx * n_dim + d];
+            dist += pow(diff, 2);
+        }
+    
+        distances_ptr[query_idx * n_candi + cand_idx] = dist;  // Store the computed distance
+    }
+}
+
 template <typename ElementType, typename IndexType>
 __global__ void process_selected_indices_kernel(const ElementType* pq_dis, IndexType* SelectedIndices, 
                                                 IndexType n_queries, int n_candies) 
@@ -608,20 +639,7 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
 
     // todo fuse the 3 kernel calls to 1
     if (is_data_changed) {
-        // Call normalize_data_labels_kernel to replace normalize_labels_kernel
-        /*
-        normalize_data_labels_kernel<<<full_block_per_grid, block_size>>>(
-            data_labels.data_handle(),            // Input data labels
-            n_data,                               // Number of queries
-            maps_len_dev,                         // Device pointer for map lengths
-            shift_len_dev,                        // Device pointer for shift lengths
-            div_value_dev,                        // Device pointer for div value
-            map_types_dev,                        // filter types array                       
-            global_min_dev,                       // Global minimum value
-            global_max_dev,                       // Global maximum value
-            f_config.l,                           // Length of intervals
-            normalized_data_labels.data_handle()  // Output to normalized_data_labels
-        );*/
+        
     }
 
     if (is_query_changed) {
@@ -778,9 +796,6 @@ inline void refine(raft::device_resources const& dev_resources,
     IndexType n_candi = neighbor_candidates.extent(1);
     IndexType k = indices.extent(1);
 
-    auto candi_vec = parafilter_mmr::make_device_matrix_view<ElementType, IndexType>(n_queries, n_dim * n_candi);
-    select_elements<ElementType, IndexType>(dev_resources, dataset, neighbor_candidates, candi_vec);
-
     int full_blocks_per_grid_x = (n_queries + block_size_x - 1) / block_size_x;
     int full_blocks_per_grid_y = (n_candi + block_size_y - 1) / block_size_y;
 
@@ -788,8 +803,8 @@ inline void refine(raft::device_resources const& dev_resources,
     dim3 full_threads_per_block(block_size_x, block_size_y);
 
     auto refine_dis = parafilter_mmr::make_device_matrix_view<ElementType, IndexType>(n_queries, n_candi);
-    calc_refine_distance_kernel<<<full_blocks_per_grid, full_threads_per_block>>>(candi_vec.data_handle(), 
-                queries.data_handle(), n_dim, n_queries, n_candi, refine_dis.data_handle());
+    compute_l2_distances_kernel<<<full_blocks_per_grid, full_threads_per_block>>>(neighbor_candidates.data_handle(), 
+        dataset.data_handle(), queries.data_handle(), refine_dis.data_handle(), n_data, n_queries, n_candi, n_dim);
     
     auto refine_indices = parafilter_mmr::make_device_matrix_view<IndexType, IndexType>(n_queries, k);
     raft::matrix::select_k<ElementType, IndexType>(dev_resources, refine_dis, std::nullopt, distances, refine_indices, true);
