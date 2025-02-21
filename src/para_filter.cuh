@@ -139,26 +139,6 @@ __global__ void normalize_constrains_kernel(const float* constrains, int l, int 
     }
 }
 
-// todo: per elements processing kernel can be implement with device lamda.
-// use none-const labels to enable on-site process
-/*
-__global__ void normalize_labels_kernel(float* data_labels, float* normalized_data_labels, 
-    uint64_t n_data, float coeff, float data_shift, float global_min, float global_max) 
-{
-    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x; 
-    if (tid >= n_data) return;
-    normalized_data_labels[tid] = (data_labels[tid] - data_shift - global_min) * coeff;
-}
-
-__global__ void denormalize_labels_kernel(const float* data, uint64_t n_data, 
-    float data_shift_l, float data_shift_r, float *out) 
-{
-    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x; 
-    if (tid >= n_data) return;
-    out[tid * 2] = data[tid] - data_shift_l;
-    out[tid * 2 + 1] = data[tid] + data_shift_r;
-}*/
-
 __global__ void denormalize_labels_kernel(const float* data, uint64_t n_data,
     const float* shift_val, const int* map_types, const float* interval_map, const int* div_values, 
     uint64_t l, float* out)

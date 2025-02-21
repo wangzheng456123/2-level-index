@@ -72,7 +72,8 @@ void parafilter_build(raft::device_resources const& dev_resources, // in: the ra
 
     raft::cluster::kmeans::KMeansParams params;
     params.n_clusters = n_clusters;
-
+    params.tol = 1e-5;
+     
     float interia;
     uint64_t niters;
 
@@ -96,9 +97,9 @@ void parafilter_build(raft::device_resources const& dev_resources, // in: the ra
                                 return static_cast<uint8_t>(ele);
                              },
                              raft::make_const_mdspan(tmp_labels));
+    
+    std::cout << "para-filter index build success with iters: " << niters << "\n";
   }
-
-  std::cout << "para-filter index build success\n";
 }
 
 void parafilter_query(raft::device_resources const& dev_resources,

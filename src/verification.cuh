@@ -66,17 +66,21 @@ inline uint64_t read_neighbors_file(const std::string& file_path, std::vector<ui
     }
 
     int neighbor;
+    std::unordered_set<int> seen_neighbors;  // Set to store already seen neighbors
+
     while (neighbors_in.read(reinterpret_cast<char*>(&neighbor), sizeof(int))) {
-        // Only store valid neighbors (>= 0)
-        if (neighbor >= 0) {
+        // Only store valid neighbors (>= 0) and ensure it's not already in the set
+        if (neighbor >= 0 && seen_neighbors.find(neighbor) == seen_neighbors.end()) {
             neighbors.push_back(neighbor);
             valid_cnt++;
+            seen_neighbors.insert(neighbor);  // Mark the neighbor as seen
         }
         else {
             // fixme: use other magic for very large dataset
-            neighbors.push_back(12345678910ll);
+            neighbors.push_back(12345678910ll);  // Use magic value for duplicate or invalid neighbors
         }
     }
+
     neighbors_in.close();
     return valid_cnt;
 }
