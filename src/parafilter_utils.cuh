@@ -29,9 +29,9 @@ inline void checkCUDAError(const char *msg, int line = -1) {
   cudaError_t err = cudaGetLastError();
   if (cudaSuccess != err) {
     if (line >= 0) {
-      fprintf(stdout, "Line %d: ", line);
+      LOG(ERROR) << "Line :" << line;
     }
-    fprintf(stdout, "Cuda error: %s: %s.\n", msg, cudaGetErrorString(err));
+    LOG(ERROR) << "Cuda error :" << msg << ":" << cudaGetErrorString(err);
     exit(EXIT_FAILURE);
   }
 }
@@ -192,19 +192,25 @@ struct parafilter_config {
           currValue = currValue.substr(quotesStart + 1, quotesEnd - 1);
         }
       }
+
+      if (str_to_offset_map.find(currConfigStr) == str_to_offset_map.end()) {
+        LOG(ERROR) << "ERROR: Key '" << currConfigStr << "' not found in str_to_offset_map!";
+        continue;
+      }
+    
       if (quotesStart == std::string::npos) {
         if (isInteger(currValue)) {
-          *(static_cast<uint64_t *>((static_cast<void*>(this) + str_to_offset_map[currConfigStr])))
-                                                         = (uint64_t)(std::atoll(currValue.c_str()));
+            *(static_cast<uint64_t *>((static_cast<void*>(this) + str_to_offset_map[currConfigStr])))
+                = (uint64_t)(std::atoll(currValue.c_str()));
         }
         else {
-          *(static_cast<float *>((static_cast<void*>(this) + str_to_offset_map[currConfigStr])))
-                                                         = (float)(std::stof(currValue.c_str()));
+            *(static_cast<float *>((static_cast<void*>(this) + str_to_offset_map[currConfigStr])))
+                = (float)(std::stof(currValue.c_str()));
         }
       }
       else {
         *(static_cast<std::string *>((static_cast<void*>(this) +  str_to_offset_map[currConfigStr])))
-                                                         = currValue;
+            = currValue;
       }
     }
   }
@@ -484,12 +490,12 @@ class parafilter_mmr {
     uint64_t size = sizeof(ElementType) * n_row * n_dim;
     if (!fake_run) {
       device_ptr = (ElementType*)mem_allocator(size);
-      LOG(TRACE) << "alloc memory with size: " << size;
+      LOG(INFO) << "alloc memory with size: " << size;
       return raft::make_device_matrix_view<ElementType, IndexType>(device_ptr, n_row, n_dim);
     }
     else {
       // nothing will happen and a null mdspan will returned
-      LOG(TRACE) << "fake alloc memory with size: " << size;
+      LOG(INFO) << "fake alloc memory with size: " << size;
       return raft::make_device_matrix_view<ElementType, IndexType>(nullptr, n_row, n_dim);
     }
   }
@@ -500,12 +506,12 @@ class parafilter_mmr {
     uint64_t size = sizeof(ElementType) * n_elements;
     if (!fake_run) {
       device_ptr = (ElementType*)mem_allocator(size);
-      LOG(TRACE) << "alloc memory with size: " << size;
+      LOG(INFO) << "alloc memory with size: " << size;
       return raft::make_device_vector_view<ElementType, IndexType>(device_ptr, n_elements);
     }
     else {
       // nothing will happen and a null mdspan will returned
-      LOG(TRACE) << "fake alloc memory with size: " << size;
+      LOG(INFO) << "fake alloc memory with size: " << size;
       return raft::make_device_vector_view<ElementType, IndexType>(nullptr, n_elements);
     }
   }

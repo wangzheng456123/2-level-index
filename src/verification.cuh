@@ -115,8 +115,16 @@ float compute_recall(const std::string& res_directory_path, const std::string& g
 
         // Now compare res_neighbors for the current query with valid ground truth neighbors
         int hits = 0;
+        std::unordered_set<int> seen_neighbors;  
+
         for (int j = 0; j < topk; ++j) {
             int idx = i * topk + j;
+            
+            if (seen_neighbors.find(res_neighbors[idx]) != seen_neighbors.end()) {
+                continue;
+            }
+            
+            seen_neighbors.insert(res_neighbors[idx]);
             if (valid_neighbors_set.find(res_neighbors[idx]) != valid_neighbors_set.end()) {
                 ++hits;
             }
