@@ -98,6 +98,24 @@ __global__ void filter_by_constrain_kernel(float* dis, const float* constrains,
     if (ans == 0) dis[idx] = std::numeric_limits<float>::max(); 
 }
 
+// CUDA kernel template
+template <typename ElementType, typename CodebookType, typename IndexType>
+__global__ void subtract_centers_kernel(ElementType* dataset, const ElementType* centers, 
+                                const CodebookType* inv_file, IndexType n_data, IndexType n_dim, int n_clusters) {
+    IndexType idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < n_data) {
+        CodebookType cluster_idx = inv_file[idx];  // Get the corresponding center index
+        
+        if (cluster_idx >= n_clusters) return; // Prevent out-of-bounds access
+
+        // Perform dataset[idx] -= centers[cluster_idx]
+        for (IndexType j = 0; j < n_dim; j++) {
+            dataset[idx * n_dim + j] -= centers[cluster_idx * n_dim + j];
+        }
+    }
+}
+
 /**/
 __global__ void calculate_filter_dis_kernel(float* dis, const float* constrains, 
                                             const float* data_labels, uint64_t l, uint64_t n_queries, uint64_t n_data) 
@@ -245,6 +263,84 @@ __global__ void build_pq_lut_kernel(
     }
 }
 
+template <typename ElementType, typename IndexType>
+__global__ void build_center_inner_product_lut_kernel(
+    const ElementType* centers, const ElementType* queries,
+    IndexType query_batch_size, ElementType* lut,
+    IndexType pq_len, IndexType pq_dim, IndexType n_dim,
+    IndexType n_queries, IndexType n_clusters)
+{
+    IndexType query_batch_id = blockIdx.x * blockDim.x + threadIdx.x;
+    IndexType cluster_id = blockIdx.y * blockDim.y + threadIdx.y;
+    IndexType cur_dim = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (cluster_id >= n_clusters || cur_dim >= pq_dim) return;
+
+    for (IndexType i = 0; i < query_batch_size; i++) {
+        IndexType qid = query_batch_id * query_batch_size + i;
+        if (qid >= n_queries) return;
+
+        IndexType lut_index = qid * pq_dim * n_clusters + cur_dim * n_clusters + cluster_id;
+        ElementType ans = 0;
+
+        for (IndexType d = 0; d < pq_len; d++) {
+            IndexType query_index = qid * n_dim + cur_dim * pq_len + d;
+            IndexType center_index = cluster_id * n_dim + cur_dim * pq_len + d;
+
+            if (cur_dim * pq_len + d >= n_dim) break;
+
+            ans += centers[center_index] * queries[query_index];
+        }
+
+        lut[lut_index] = ans;
+    }
+}
+
+__global__ void compute_cross_LUT_kernel(
+    const float *pq_centers,      // (pq_dim, n_clusters * pq_len)
+    const float *coarsed_centers, // (n_clusters, n_dim)
+    float *cross_lut,             // (pq_dim, n_clusters * n_clusters)
+    int pq_dim, int n_clusters, int pq_len, int n_dim) 
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; // Index along pq_dim
+    int j = blockIdx.y * blockDim.y + threadIdx.y; // Index along n_clusters * n_clusters
+
+    if (i >= pq_dim || j >= n_clusters * n_clusters) return;
+
+    int cluster1 = j / n_clusters; // First cluster index
+    int cluster2 = j % n_clusters; // Second cluster index
+
+    float dot_product = 0.0f;
+
+    for (int k = 0; k < pq_len; k++) {
+        int idx1 = cluster1 * pq_len + k; // Column index in pq_centers
+        int idx2 = cluster2 * n_dim + i * pq_len + k; // Column index in coarsed_centers
+        if (i * pq_len + k >= n_dim) break; // Ensure valid range, pad with 0 if exceeded
+        dot_product += pq_centers[i * (n_clusters * pq_len) + idx1] * coarsed_centers[idx2];
+    }
+
+    cross_lut[i * (n_clusters * n_clusters) + j] = dot_product;
+}
+
+__global__ void compute_l2_norms_kernel(const float* coarsed_centers, float* norms, int n_clusters, int n_dim, int pq_dim, int pq_len) 
+{
+    int cluster_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int pq_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (cluster_idx >= n_clusters || pq_idx >= pq_dim) return;
+    
+    float norm = 0.0f;
+    int start_idx = cluster_idx * n_dim + pq_idx * pq_len;
+    
+    for (int i = 0; i < pq_len; ++i) {
+        int idx = start_idx + i;
+        float val = (idx < (cluster_idx + 1) * n_dim) ? coarsed_centers[idx] : 0.0f;
+        norm += val * val;
+    }
+    
+    norms[cluster_idx * pq_dim + pq_idx] = norm;
+}
+
 template <typename CodebookType, typename ElementType, typename IndexType>
 __global__ void compute_batched_L2_distance_kernel(
     const CodebookType* codebook,   // Codebook: n_data * pq_dim, column-major
@@ -272,6 +368,95 @@ __global__ void compute_batched_L2_distance_kernel(
             }
 
             result[(query_start + q) * n_data + data_start + d] = sum;
+        }
+    }
+}
+
+template <typename CodebookType, typename ElementType, typename IndexType>
+__global__ void compute_batched_L2_distance_with_residual_kernel(
+    const CodebookType* codebook,      // Codebook: n_data * pq_dim, column-major
+    const ElementType* lut,           // LUT: n_queries * pq_dim * n_clusters
+    const ElementType* cross_lut,     // Cross LUT: pq_dim * n_clusters * n_clusters
+    const ElementType* norms,         // Norms matrix: n_clusters * pq_dim
+    const CodebookType* inv_file,        // Inverted file: n_data (mapping to cluster ID)
+    const ElementType* inner_product_lut, // Inner product LUT: n_queries * pq_dim * n_clusters
+    ElementType* result,              // Output: n_queries * n_data
+    IndexType n_data,                 // Number of data points
+    IndexType pq_dim,                 // Number of dimensions
+    IndexType n_clusters,             // Number of clusters
+    IndexType n_queries,              // Number of queries
+    IndexType data_batch_size,        // Batch size for data
+    IndexType query_batch_size)       // Batch size for queries
+{
+    // Thread's starting position
+    IndexType query_start = blockIdx.y * blockDim.y * query_batch_size + threadIdx.y * query_batch_size;
+    IndexType data_start = blockIdx.x * blockDim.x * data_batch_size + threadIdx.x * data_batch_size;
+
+    // Temporary sum storage for batch
+    for (IndexType q = 0; q < query_batch_size && query_start + q < n_queries; q++) {
+        for (IndexType d = 0; d < data_batch_size && data_start + d < n_data; d++) {
+            ElementType sum = 0;
+            CodebookType cid = inv_file[data_start + d]; // Get cluster ID from inverted file
+
+            for (IndexType dim = 0; dim < pq_dim; dim++) {
+                CodebookType lut_idx = codebook[dim * n_data + data_start + d];  // Column-major access
+                // calculation: dis = (q - ri) ^ 2 - 2 * dot(q - ri, ci) + ci ^ 2
+                sum += lut[(query_start + q) * pq_dim * n_clusters + dim * n_clusters + lut_idx]; // term: (q - ri) ^ 2
+                sum += 2 * cross_lut[dim * n_clusters * n_clusters + lut_idx * n_clusters + cid]; // term: 2 * dot(ci, ri)
+                sum += norms[cid * pq_dim + dim]; //term: ci ^ 2
+                sum -= 2 * inner_product_lut[(query_start + q) * pq_dim * n_clusters + dim * n_clusters + cid]; // term: -2 * dot(ci, q) 
+            }
+            
+            result[(query_start + q) * n_data + data_start + d] = sum;
+        }
+    }
+}
+
+template <typename CodebookType, typename ElementType, typename IndexType>
+__global__ void compute_batched_L2_distance_with_residual_slow_kernel(
+    const CodebookType* codebook,     // Codebook: n_data * pq_dim, column-major
+    const CodebookType* inv_file,     // Inverted file: n_data (mapping to cluster ID)
+    const ElementType* centers,       // Centers vector for residual (n_queries * n_clusters * pq_dim)
+    const ElementType* coarse_centers,// Centers vector for invfile (n_clusters * n_dim)
+    const ElementType* queries,       // Queries vector
+    ElementType* result,              // Output: n_queries * n_data
+    IndexType n_data,                 // Number of data points
+    IndexType pq_dim,                 // Number of dimensions
+    IndexType pq_len,                 // Dimensions per subspace
+    IndexType n_queries,              // Number of queries
+    IndexType n_dim,                  // Dimension of vector
+    IndexType n_clusters,             // Number of clusters (newly added parameter)
+    IndexType data_batch_size,        // Batch size for data
+    IndexType query_batch_size)       // Batch size for queries
+{
+    // Thread's starting position
+    IndexType query_start = blockIdx.y * blockDim.y * query_batch_size + threadIdx.y * query_batch_size;
+    IndexType data_start = blockIdx.x * blockDim.x * data_batch_size + threadIdx.x * data_batch_size;
+
+    // Temporary sum storage for batch
+    for (IndexType q = 0; q < query_batch_size && query_start + q < n_queries; q++) {
+        for (IndexType d_idx = 0; d_idx < data_batch_size && data_start + d_idx < n_data; d_idx++) {
+            ElementType res = 0;  // L2 distance accumulator
+
+            CodebookType cid = inv_file[data_start + d_idx]; // Get cluster ID from inverted file
+            
+            for (IndexType dim = 0; dim < pq_dim; dim++) {
+                CodebookType lut_idx = codebook[dim * n_data + data_start + d_idx]; 
+                
+                for (IndexType sub_dim = 0; sub_dim < pq_len; sub_dim++) {
+                    if (dim * pq_len + sub_dim >= n_dim) break;
+
+                    // Compute residuals and centers correctly with `n_clusters`
+                    ElementType residual = centers[dim * n_clusters * pq_len + lut_idx * pq_len + sub_dim];
+                    ElementType inv_center = coarse_centers[cid * n_dim + dim * pq_len + sub_dim];
+                    ElementType query_val = queries[(query_start + q) * n_dim + dim * pq_len + sub_dim];
+
+                    res += pow((query_val - residual - inv_center), 2);
+                }
+            }
+
+            // Store computed distance in result matrix
+            result[(query_start + q) * n_data + (data_start + d_idx)] = res;
         }
     }
 }
@@ -667,16 +852,17 @@ inline void calc_batched_L2_distance(raft::device_resources const& dev_resources
                                      raft::device_matrix_view<float, uint64_t> dis,
                                      uint64_t pq_dim,  
                                      uint64_t pq_len,
+                                     uint64_t n_clusters = 256,
                                      uint64_t query_batch_size = 1, 
-                                     uint64_t data_batch_size = 1, 
-                                     uint64_t n_clusters = 256) 
+                                     uint64_t data_batch_size = 1 
+                                     ) 
 {
     uint64_t n_dim = queries.extent(1);
     uint64_t n_data = codebook.extent(1);
     uint64_t n_queries = queries.extent(0);
 
-    std::cout << "calc vector similarity: with data size: " << n_data 
-                    << ", query cnt: " << n_queries << ", pq dimension: " << pq_dim << "\n";
+    LOG(INFO) << "calc vector similarity: with data size: " << n_data 
+                    << ", query cnt: " << n_queries << ", pq dimension: " << pq_dim;
 
     // int one cuda thread, process a batched of queries and data vectors
     uint64_t data_batch_cnt = (n_data + data_batch_size - 1) / data_batch_size;
@@ -709,6 +895,91 @@ inline void calc_batched_L2_distance(raft::device_resources const& dev_resources
     );
     checkCUDAErrorWithLine("launch pq similarity calculation kernel failed!");
 } 
+
+inline void calc_batched_L2_distance_with_residual(
+                                     raft::device_resources const& dev_resources,
+                                     raft::device_matrix_view<float, uint64_t> const& queries, 
+                                     raft::device_matrix_view<uint8_t, uint64_t> const& codebook,
+                                     raft::device_matrix_view<float, uint64_t> const& centers, 
+                                     raft::device_matrix_view<float, uint64_t> const& coarse_centers, 
+                                     raft::device_vector_view<uint8_t, uint64_t> const& inv_file, 
+                                     raft::device_matrix_view<float, uint64_t> dis,
+                                     uint64_t pq_dim,  
+                                     uint64_t pq_len,
+                                     uint64_t n_clusters = 256,
+                                     uint64_t query_batch_size = 1, 
+                                     uint64_t data_batch_size = 1) 
+{
+    uint64_t n_dim = queries.extent(1);
+    uint64_t n_queries = queries.extent(0);
+    uint64_t n_data = codebook.extent(1);
+
+    // Allocate memory for LUTs and intermediate results
+    float* norms = static_cast<float*>(parafilter_mmr::mem_allocator(n_clusters * pq_dim * sizeof(float)));
+    float* cross_lut = static_cast<float*>(parafilter_mmr::mem_allocator(pq_dim * n_clusters * n_clusters * sizeof(float)));
+    float* center_inner_product_lut = static_cast<float*>(parafilter_mmr::mem_allocator(n_queries * pq_dim * n_clusters * sizeof(float)));
+    float* pq_lut = static_cast<float*>(parafilter_mmr::mem_allocator(n_queries * pq_dim * n_clusters * sizeof(float)));
+    
+    // Compute norms of coarse centers
+    dim3 block_per_grid; 
+    dim3 thread_per_block(16, 16);
+
+    block_per_grid.x = (n_clusters + thread_per_block.x - 1) / thread_per_block.x;
+    block_per_grid.y = (pq_dim + thread_per_block.y - 1) / thread_per_block.y;
+    compute_l2_norms_kernel<<<block_per_grid, thread_per_block>>>(coarse_centers.data_handle(), norms, n_clusters, n_dim, pq_dim, pq_len);
+    checkCUDAErrorWithLine("call l2 norm build kernel failed!");
+
+    // Compute cross LUT
+    block_per_grid.y = (n_clusters * n_clusters + thread_per_block.y - 1) / thread_per_block.y; 
+    block_per_grid.x = (pq_dim + thread_per_block.x - 1) / thread_per_block.x;
+    // todo: this table is not depends on any query, needs to be build only once
+    compute_cross_LUT_kernel<<<block_per_grid, thread_per_block>>>(
+        centers.data_handle(), coarse_centers.data_handle(),
+        cross_lut, pq_dim, n_clusters, pq_len, n_dim);
+    checkCUDAErrorWithLine("call cross lut build kernel failed!");
+
+    // Compute inner product LUT for centers and queries
+    thread_per_block = dim3(8, 8, 8);
+    block_per_grid.x = (n_queries + thread_per_block.x - 1) / thread_per_block.x;
+    block_per_grid.y = (n_clusters + thread_per_block.y - 1) / thread_per_block.y;
+    block_per_grid.z = (pq_dim + thread_per_block.z - 1) / thread_per_block.z;
+    
+    build_center_inner_product_lut_kernel<<<block_per_grid, thread_per_block>>>(
+        coarse_centers.data_handle(), queries.data_handle(), query_batch_size,
+        center_inner_product_lut, pq_len, pq_dim, n_dim, n_queries, n_clusters);
+    checkCUDAErrorWithLine("call coarsed dot product lut build kernel failed!");
+
+    // Compute PQ LUT
+    build_pq_lut_kernel<<<block_per_grid, thread_per_block>>>(
+        centers.data_handle(), queries.data_handle(), query_batch_size,
+        pq_lut, pq_len, pq_dim, n_dim, n_queries, n_clusters);
+
+    // Compute final L2 distances
+    uint64_t data_batch_cnt = (n_data + data_batch_size - 1) / data_batch_size;
+    uint64_t query_batch_cnt = (n_queries + query_batch_size - 1)  / query_batch_size;
+
+    thread_per_block = dim3(16, 16);
+    block_per_grid.y = (query_batch_cnt + thread_per_block.y - 1) / thread_per_block.y;
+    block_per_grid.x = (data_batch_cnt + thread_per_block.x - 1) / thread_per_block.x;
+    
+    compute_batched_L2_distance_with_residual_kernel<<<block_per_grid, thread_per_block>>>(
+        codebook.data_handle(),         // Codebook: n_data * pq_dim, column-major
+        pq_lut,                         // LUT: n_queries * pq_dim * n_clusters
+        cross_lut,                      // Cross LUT: pq_dim * n_clusters * n_clusters
+        norms,                          // Norms matrix: n_clusters * pq_dim
+        inv_file.data_handle(),         // Inverted file: n_data (mapping to cluster ID)
+        center_inner_product_lut,       // Inner product LUT: n_queries * pq_dim * n_clusters
+        dis.data_handle(),              // Output: n_queries * n_data
+        n_data,                         // Number of data points
+        pq_dim,                         // Number of dimensions
+        n_clusters,                     // Number of clusters
+        n_queries,                      // Number of queries
+        data_batch_size,                // Batch size for data
+        query_batch_size                // Batch size for queries
+    );
+
+    checkCUDAErrorWithLine("launch residual pq dis calc kernel failed!");
+}
 
 // select elements of in an indices set from the input matrix and put it into the output matrix
 template<typename ElementType, typename IndexType>
@@ -856,7 +1127,7 @@ void sliceMatrix(const m_t* in,
 
 template <typename m_t, typename idx_t, typename layout_t>
 void slice(raft::resources const& handle,
-           raft::device_matrix_view<const m_t, idx_t, layout_t> in,
+           raft::device_matrix_view<m_t, idx_t, layout_t> const& in,
            raft::device_matrix_view<m_t, idx_t, layout_t> out,
            slice_coordinates<idx_t> coords)
 {
@@ -887,4 +1158,32 @@ void calc_pairwise_filter_dis(raft::device_matrix_view<float, uint64_t> const &d
 
     calculate_filter_dis_kernel<<<grid_block_size, thread_block_size>>>(filter_dis.data_handle(), 
             constrains.data_handle(), data_labels.data_handle(), l, n_queries, n_data);
+}
+
+
+// Wrapper function template for RAFT device_matrix_view
+template <typename ElementType, typename CodebookType, typename IndexType>
+void substract_centers(raft::device_matrix_view<ElementType, IndexType> dataset_view, 
+                       raft::device_matrix_view<ElementType, IndexType> centers_view, 
+                       raft::device_vector_view<CodebookType, IndexType> inv_file_view) 
+{
+    // Get dimensions
+    IndexType n_data = dataset_view.extent(0);
+    IndexType n_dim = dataset_view.extent(1);
+    int n_clusters = centers_view.extent(0);
+
+    // Get raw GPU pointers
+    ElementType* dataset_ptr = dataset_view.data_handle();
+    const ElementType* centers_ptr = centers_view.data_handle();
+    const CodebookType* inv_file_ptr = inv_file_view.data_handle();
+
+    // CUDA kernel launch configuration
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (n_data + threadsPerBlock - 1) / threadsPerBlock;
+
+    // Launch CUDA kernel
+    subtract_centers_kernel<<<blocksPerGrid, threadsPerBlock>>>(dataset_ptr, centers_ptr, inv_file_ptr, 
+                                                                n_data, n_dim, n_clusters);
+
+    // Synchronize to ensure kernel completion
 }

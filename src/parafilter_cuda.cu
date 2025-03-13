@@ -42,40 +42,67 @@ void get_parafilter_config(parafilter_config **conf, const char path[] = "parafi
 }
 
 void parafilter_build(raft::device_resources const& dev_resources, // in: the raft resources
-                      raft::device_matrix_view<const float, uint64_t> dataset, //in: the training dataset
+                      raft::device_matrix_view<float, uint64_t> dataset, //in: the training dataset
                       size_t pq_dim,  //in: dimesnion of the pq vector
                       size_t pq_len, 
                       size_t n_clusters, //in: number of clusters for each subspace
                       raft::device_matrix_view<uint8_t, uint64_t> codebook, //out: codebook
-                      raft::device_matrix_view<float, uint64_t> centers) // out: centers
+                      raft::device_matrix_view<float, uint64_t> centers, // out: centers
+                      raft::device_vector_view<uint8_t, uint64_t> inv_file, // inverted index file for the dataset
+                      raft::device_matrix_view<float, uint64_t> coarse_centers_view) // clusters for the dataset
 {
   uint64_t n_row = dataset.extent(0);
   uint64_t n_dim = dataset.extent(1);
 
-  std::cout << "build pq codebook with dataset size: " << n_row << ", data dimension: " << n_dim << 
+  LOG(INFO) << "build pq codebook with dataset size: " << n_row << ", data dimension: " << n_dim << 
     ", pq dimension: " << pq_dim << ", number of cluserters: " << n_clusters << "\n";
 
   // todo: properly processing n_dim is'n multiple of pq_dim
-  auto tmp_train = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_row, pq_len);
-  auto tmp_labels = parafilter_mmr::make_device_vector_view<uint64_t, uint64_t>(n_row);
 
+  raft::cluster::kmeans::KMeansParams params;
+  params.n_clusters = n_clusters;
+  params.tol = 1e-5;
+
+  float interia;
+  uint64_t niters;
+
+  auto tmp_inv_file = parafilter_mmr::make_device_vector_view<uint64_t, uint64_t>(n_row);
+  raft::cluster::kmeans::fit_predict<float, uint64_t>(
+    dev_resources, 
+    params, 
+    dataset, 
+    std::nullopt, 
+    coarse_centers_view, 
+    tmp_inv_file,
+    raft::make_host_scalar_view(&interia), 
+    raft::make_host_scalar_view(&niters));
+
+  raft::linalg::map_offset(dev_resources,  
+                           inv_file, 
+                           [] __device__ (const uint64_t idx, const uint64_t ele) {
+                            return static_cast<uint8_t>(ele);
+                           },
+                           raft::make_const_mdspan(tmp_inv_file));
+  
+  
   // use 2 dimesnional matrix as the low level container
   uint64_t centers_len = n_clusters * pq_len;
+  auto tmp_train = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_row, pq_len);
+  auto tmp_labels = parafilter_mmr::make_device_vector_view<uint64_t, uint64_t>(n_row);
+  auto tmp_center_slice = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_clusters, pq_len);
 
   for (int i = 0; i < pq_dim; i++) {
     if (i == pq_dim - 1) {
       cudaMemset(tmp_train.data_handle(), 0, tmp_train.size());
+      cudaMemset(tmp_center_slice.data_handle(), 0, tmp_center_slice.size());
     }
     slice_coordinates<uint64_t> coords{0, i * pq_len, n_row, std::min((i + 1) * pq_len, n_dim)};
+    slice_coordinates<uint64_t> center_coords{0, i * pq_len, n_clusters, std::min((i + 1) * pq_len, n_dim)};
+
     // todo: remove this copy since it is time consuming for large dataset.
     slice(dev_resources, dataset, tmp_train, coords);
-
-    raft::cluster::kmeans::KMeansParams params;
-    params.n_clusters = n_clusters;
-    params.tol = 1e-5;
-     
-    float interia;
-    uint64_t niters;
+    slice(dev_resources, coarse_centers_view, tmp_center_slice, center_coords);
+    substract_centers(tmp_train, tmp_center_slice, inv_file);
 
     auto cur_centers_view = raft::make_device_matrix_view<float, uint64_t>(centers.data_handle() + centers_len * i, n_clusters, pq_len);
 
@@ -97,8 +124,7 @@ void parafilter_build(raft::device_resources const& dev_resources, // in: the ra
                                 return static_cast<uint8_t>(ele);
                              },
                              raft::make_const_mdspan(tmp_labels));
-    
-    std::cout << "para-filter index build success with iters: " << niters << "\n";
+  
   }
 }
 
@@ -114,6 +140,8 @@ void parafilter_query(raft::device_resources const& dev_resources,
                       raft::device_matrix_view<float, uint64_t> const& ranges,
                       raft::device_matrix_view<float, uint64_t> selected_distance, 
                       raft::device_matrix_view<uint64_t, uint64_t> selected_indices,
+                      raft::device_matrix_view<float, uint64_t> coarse_centers_view,
+                      raft::device_vector_view<uint8_t, uint64_t> inv_file,
                       uint32_t* exps,
                       int pq_dim, 
                       int pq_len, 
@@ -124,10 +152,13 @@ void parafilter_query(raft::device_resources const& dev_resources,
   int n_queries = queries.extent(0);
   int n_dim = dataset.extent(1);
   int l = data_labels.extent(1);
+  int n_clusters = centers.extent(1) / pq_len;
 
   auto vec_dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, n_data); 
   // todo: batch size needs modification
-  calc_batched_L2_distance(dev_resources, queries, codebook, centers, vec_dis, pq_dim, pq_len);
+  // calc_batched_L2_distance(dev_resources, queries, codebook, centers, vec_dis, pq_dim, pq_len, n_clusters);
+  calc_batched_L2_distance_with_residual(dev_resources, queries, codebook, centers, 
+                    coarse_centers_view, inv_file, vec_dis, pq_dim, pq_len, n_clusters);
 
   auto label_dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, n_data); 
 
@@ -194,7 +225,7 @@ inline void parafilter_calc_input_size_map(std::map<std::string, std::pair<uint6
 // todo2: not allocate actual cuda memory in fake run 
 void parafilter_build_run(raft::device_resources const& dev_resources,
                           raft::device_matrix_view<float, uint64_t> const& queries,
-                          raft::device_matrix_view<float, uint64_t> const& dataset,
+                          raft::device_matrix_view<float, uint64_t> dataset,
                           raft::device_matrix_view<float, uint64_t> const& data_labels,
                           raft::device_matrix_view<float, uint64_t> const& query_labels,
                           raft::device_matrix_view<float, uint64_t> selected_distance,
@@ -218,10 +249,17 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
 
     thread_local raft::device_matrix_view<uint8_t, uint64_t> codebook{};
     thread_local raft::device_matrix_view<float, uint64_t> centers{};
+    thread_local raft::device_matrix_view<float, uint64_t> coarse_centers_view{};
+    thread_local raft::device_vector_view<uint8_t, uint64_t> inv_file{};
+    
     if (run_build) {
         codebook = parafilter_mmr::make_device_matrix_view<uint8_t, uint64_t>(pq_dim, n_data);
         centers = parafilter_mmr::make_device_matrix_view<float, uint64_t>(pq_dim, n_clusters * pq_len);
-        parafilterPerfLogWraper(parafilter_build(dev_resources, dataset, pq_dim, pq_len, n_clusters, codebook, centers), build_time);
+        inv_file = parafilter_mmr::make_device_vector_view<uint8_t, uint64_t>(n_data);
+        coarse_centers_view = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_clusters, n_dim);
+        
+        parafilterPerfLogWraper(parafilter_build(dev_resources, dataset, pq_dim, pq_len, n_clusters, 
+                  codebook, centers, inv_file, coarse_centers_view), build_time);
     }
 
     bool is_data_changed = false;
@@ -265,6 +303,8 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                      ranges, 
                      selected_distance, 
                      selected_indices, 
+                     coarse_centers_view, 
+                     inv_file,
                      exps, 
                      pq_dim, 
                      pq_len, 
@@ -679,13 +719,16 @@ bool read_coeff_from_binary(const std::string& file_path, double coeff[4]) {
     return true;
 }
 
-int main()
+int main(int argc, char* argv[])
 {
   parafilter_mmr::init_mmr();
 
+  const char* default_config_dir = "parafilter.conf";
+  const char* config_dir = (argc < 2) ? default_config_dir : argv[1];
+
   parafilter_config *p_config = nullptr;
 
-  get_parafilter_config(&p_config);
+  get_parafilter_config(&p_config, config_dir);
   std::string dataset_path = p_config->path;
 
   std::vector<std::string> keys;
@@ -697,6 +740,9 @@ int main()
   std::string filter_conf_path = dataset_path + "filter.conf";
 
   filter_config f_config(filter_conf_path);
+
+  el::Configurations conf("myeasylogger.conf");
+  el::Loggers::reconfigureLogger("default", conf);
 
   if (p_config->break_down) break_down = true;
   std::map<std::string, std::pair<int32_t, int32_t>> size_map;
@@ -713,10 +759,12 @@ int main()
 
   uint32_t exps[2];
   exps[0] = p_config->exp1;
-  exps[1] = p_config->exp2;
+  exps[1] = p_config->exp1;
   uint32_t topk = p_config->topk;
   float merge_rate = p_config->merge_rate;
 
+  LOG(TRACE) << "run with config: dataset = " << dataset_path << ", pq_dim = " << pq_dim << 
+             ", n_clusters = " << n_clusters << ", exps = " << exps[0]; 
   double coeff[4];
   if (p_config->is_calc_mem_predictor_coeff) {
     raft::device_resources dev_resources;
@@ -752,8 +800,8 @@ int main()
     uint64_t query_batch_size, data_batch_size;
     split_task(coeff, tot_samples, n_queries, topk, p_config->mem_bound, 
         query_batch_size, data_batch_size);
-
-    LOG(INFO) << "device :" << i << " choose data batach size:" 
+    
+    LOG(TRACE) << "device :" << i << " choose data batach size:" 
         << data_batch_size << " query batch size" <<  query_batch_size;
 
     uint64_t inter_buffer_size = topk * query_batch_size;
@@ -817,7 +865,7 @@ int main()
       }
     }
     cudaDeviceSynchronize();
-    LOG(INFO) << "device: " << i << "build time:" << build_time << ", query time:" << query_time;
+    LOG(TRACE) << "device: " << i << "build time:" << build_time << ", query time:" << query_time;
     parafilter_mmr::free_cur_workspace_device_mems();
     cudaFree(selected_distance_device_ptr);
     cudaFree(selected_indices_device_ptr);
@@ -828,7 +876,8 @@ int main()
       auto merged_dis_view = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, topk);
       auto merged_idx_view = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk);
 
-      merge_intermediate_result<float, uint64_t>(
+      parafilterPerfLogWraper(
+        (merge_intermediate_result<float, uint64_t>)(
                                 dev_resources,
                                 "res/", 
                                 batch_size, 
@@ -838,7 +887,9 @@ int main()
                                 0l, 
                                 i, 
                                 merged_dis_view, 
-                                merged_idx_view);
+                                merged_idx_view), 
+        query_time
+      );
       cudaEventRecord(compute_done_event[0]);
       // todo: process the case when output buffer large than the tmp buffer
       flush_current_res(merged_dis_view.data_handle(), merged_idx_view.data_handle(), 
@@ -862,7 +913,7 @@ int main()
   for(auto &w: workers) w.join();
 
   float recall = compute_recall("./res", std::string(dataset_path + "neighbors"), topk, tot_queries);
-  LOG(INFO) << "final recall: " << recall;
+  LOG(TRACE) << "final recall: " << recall;
   delete p_config;
 
   return 0;
