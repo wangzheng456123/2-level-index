@@ -126,44 +126,37 @@ void parafilter_query(raft::device_resources const& dev_resources,
   int l = data_labels.extent(1);
   int n_clusters = centers.extent(1) / pq_len;
 
-  auto vec_dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, n_data); 
-  // todo: batch size needs modification
-  calc_batched_L2_distance(dev_resources, queries, codebook, centers, vec_dis, pq_dim, pq_len, 1, 1, n_clusters);
+  auto valid_indices = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, n_data);
+  void* vec_dis_mem = parafilter_mmr::mem_allocator(n_queries * n_data * sizeof(float)); 
 
-  auto label_dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, n_data); 
+  uint64_t valid_cnt = filter_valid_data(data_labels, ranges, valid_indices);
+  auto vec_dis = raft::make_device_matrix_view<float, uint64_t>((float *)vec_dis_mem, n_queries, valid_cnt);
+  LOG(TRACE) << "query batch maximum valid indices cnt: " << valid_cnt;
+  calc_batched_L2_distance(dev_resources, queries, valid_indices, codebook, centers, vec_dis, pq_dim, pq_len, 1, 1, n_clusters, valid_cnt);
+  topk = min((uint64_t)topk, valid_cnt);
 
-  // calculated distance between data lables and normalized constrains
-  auto metric = raft::distance::DistanceType::L2Expanded;
+  auto first_val_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(float));
+  auto first_idx_indirect_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(uint64_t));
+  auto first_idx_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(uint64_t));
 
-  // raft::distance::pairwise_distance(dev_resources, 
-  //        normalized_query_labels, normalized_data_labels, label_dis, metric);
+  int exp_topk = min((uint64_t)topk * exps[0], valid_cnt);
 
-  calc_pairwise_filter_dis(data_labels, ranges, label_dis);
-  // sum distance of vectors and lebels
-  auto dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, n_data);
-  matrix_add_with_weights<float, uint64_t>(dev_resources, vec_dis, label_dis, dis, 1.f, merge_rate);
+  auto first_val = raft::make_device_matrix_view<float, uint64_t>((float*)first_val_mem, n_queries, exp_topk);
+  auto first_idx_indirect = raft::make_device_matrix_view<uint64_t, uint64_t>((uint64_t*)first_idx_indirect_mem, n_queries, exp_topk);
+  auto first_idx = raft::make_device_matrix_view<uint64_t, uint64_t>((uint64_t*)first_idx_mem, n_queries, exp_topk);
+
+  raft::matrix::select_k<float, uint64_t>(dev_resources, vec_dis, std::nullopt, first_val, first_idx_indirect, true, true);
+  auto valid_indices_data = valid_indices.data_handle();
+  auto first_idx_indirect_data = first_idx_indirect.data_handle();
   
-  auto first_candi_labels = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, topk * exps[0] * l);
-  auto first_val = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, topk * exps[0]);
-  auto first_idx = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk * exps[0]);
-
-  raft::matrix::select_k<float, uint64_t>(dev_resources, dis, std::nullopt, first_val, first_idx, true, true);
-  
-  select_elements<float, uint64_t>(dev_resources, data_labels, first_idx, first_candi_labels);
-  select_elements<float, uint64_t>(dev_resources, vec_dis, first_idx, first_val, false);
-
-  auto second_indices = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk * exps[1]);
-  filter_candi_by_labels(dev_resources, first_candi_labels, ranges, first_val, topk * exps[1], second_indices);
-
-  auto second_indices_direct = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, topk * exps[1]);
-  select_elements<uint64_t, uint64_t>(dev_resources, first_idx, second_indices, second_indices_direct, false);
-  auto second_indices_direct_ptr = second_indices_direct.data_handle();
+  select_elements<uint64_t, uint64_t>(dev_resources, valid_indices, first_idx_indirect, first_idx, false);
+  auto first_idx_data = first_idx.data_handle();
 
   refine<float, uint64_t>(
          dev_resources, 
          dataset,
          queries,  
-         second_indices_direct, 
+         first_idx, 
          selected_indices,
          selected_distance);
 } 
