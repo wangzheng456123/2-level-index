@@ -386,6 +386,15 @@ void calc_mem_predictor_coeff(raft::device_resources const& dev_resources,
     coeff[i] = mat[i][4];
 }
 
+inline uint64_t compute_value(const double* coeff, uint64_t data_batch_size, uint64_t query_batch_size) {
+  return static_cast<uint64_t>(
+      coeff[0] * data_batch_size + 
+      coeff[1] * query_batch_size +
+      coeff[2] * data_batch_size * query_batch_size + 
+      coeff[3] + 1
+  );
+}
+
 void split_task(double* coeff,
                 uint64_t n_data, 
                 uint64_t n_queries,
@@ -420,10 +429,7 @@ void split_task(double* coeff,
 
       while (l_q < r_q) {
         uint64_t mid_q = (l_q + r_q + 1) >> 1;
-        uint64_t value = coeff[0] * mid_d + 
-                         coeff[1] * mid_q +
-                         coeff[2] * mid_d * mid_q + 
-                         coeff[3] + 1;
+        uint64_t value = compute_value(coeff, mid_d, mid_q);
 
         if (value > upper_bound) r_q = mid_q - 1;
         else l_q = mid_q; 
@@ -438,8 +444,8 @@ void split_task(double* coeff,
   };
   // todo: when cannot find proper batch size for current upper bound, enlarge it
   bisearch_proper_split(upper_bound);
-  while (n_queries % query_batch_size != 0) query_batch_size--;
-  data_batch_size = findMaxFactor(data_batch_size, n_data);
+  // while (n_queries % query_batch_size != 0) query_batch_size--;
+  // data_batch_size = findMaxFactor(data_batch_size, n_data);
 }
 
 void calculate_batch_min_max(const std::string& path, std::vector<float> &global_min, std::vector<float> &global_max, 
@@ -739,6 +745,16 @@ int main(int argc, char* argv[])
     calc_mem_predictor_coeff(dev_resources, pq_dim, n_dim, l, tot_samples, 
             tot_queries, n_clusters, exps, topk, coeff, f_config);
     write_coeff_to_binary("coeff", coeff);
+    
+    uint64_t query_batch_size, data_batch_size;
+    split_task(coeff, tot_samples, tot_queries, topk, p_config->mem_bound, 
+      query_batch_size, data_batch_size);
+    
+    uint64_t value = compute_value(coeff, data_batch_size, query_batch_size);
+
+    LOG(TRACE) << "choose data batach size:" << data_batch_size << " query batch size" <<  query_batch_size;
+    LOG(TRACE) << "The final memory usage is: " << (double)value / 1024.0 / 1024.0 << "MB";
+
     return 0;
   }
   read_coeff_from_binary("coeff", coeff);
