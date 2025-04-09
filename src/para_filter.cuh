@@ -5,6 +5,11 @@
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_resources.hpp>
 #include <raft/matrix/select_k.cuh>
+#include <thrust/device_vector.h>
+#include <thrust/scan.h>
+#include <thrust/execution_policy.h>
+#include <thrust/sort.h>
+#include <thrust/binary_search.h>
 #include <assert.h>
 #include <cmath>
 
@@ -96,6 +101,58 @@ __global__ void filter_by_constrain_kernel(float* dis, const float* constrains,
 
     int idx = x * n_candi + y;
     if (ans == 0) dis[idx] = std::numeric_limits<float>::max(); 
+}
+
+/*for the value in dis, if it pass the filter constrains, save its value, otherwise drop it*/
+__global__ void mark_valid_kernel(const float* constrains, 
+                                  const float* data_label, int l, 
+                                  int n_queries, int n_data, int* res, 
+                                  uint64_t* coarse_filtered_indices, 
+                                  uint64_t n_corase_filtered_indices) 
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= n_queries || y >= n_corase_filtered_indices) return ;
+    int ans = 1;
+
+    uint64_t idx = coarse_filtered_indices[x * n_corase_filtered_indices + y];
+    if (idx >= n_data) return;
+
+    for (int i = 0; i < l; i++) {
+        float li = constrains[x * l * 2 + i * 2];
+        float ri = constrains[x * l * 2 + i * 2 + 1];
+
+        float label = data_label[idx * l + i];
+
+        if (label < li || label > ri) {
+            ans = 0;
+            break;
+        }
+    }
+
+    res[x * n_corase_filtered_indices + y] = ans; 
+}
+
+// **Kernel: Store valid indices and count per row**
+__global__ void write_res_kernel(const int* valid_flags, const uint64_t* valid_flags_prefix_sum, 
+                                 uint64_t* output, uint64_t* row_counts, uint64_t rows, uint64_t cols) 
+{
+    uint64_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t col = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= rows || col >= cols) return;
+
+    uint64_t idx = row * cols + col;
+
+    if (valid_flags[idx]) {
+        uint64_t pos = valid_flags_prefix_sum[idx]; // Compute output position
+        output[row * cols + pos - 1] = col; // Store column index of valid elements
+    }
+
+    // The last prefix sum entry in each row gives the total count
+    if (col == cols - 1) {
+        row_counts[row] = valid_flags_prefix_sum[idx]; 
+    }
 }
 
 /**/
@@ -253,13 +310,17 @@ template <typename CodebookType, typename ElementType, typename IndexType>
 __global__ void compute_batched_L2_distance_kernel(
     const CodebookType* codebook,   // Codebook: n_data * pq_dim, column-major
     const ElementType* lut,        // LUT: n_queries * pq_dim * n_clusters
+    const IndexType* indices,      // Post filtered indices 
     ElementType* result,           // Output: n_queries * n_data
-    IndexType n_data,              // Number of data points
+    IndexType n_data,              // Number of valid data after filter
+    IndexType tot_data,            // Total number of data
+    IndexType coarsed_data_cnt,    // Number of data after coarsed filter
     IndexType pq_dim,              // Number of dimensions
     IndexType n_clusters,          // Number of clusters
     IndexType n_queries,           // Number of queries
     IndexType data_batch_size,     // Batch size for data
-    IndexType query_batch_size)    // Batch size for queries
+    IndexType query_batch_size   // Batch size for queries
+    )    
 {
     // Thread's starting position
     IndexType query_start = blockIdx.y * blockDim.y * query_batch_size + threadIdx.y * query_batch_size;
@@ -268,10 +329,15 @@ __global__ void compute_batched_L2_distance_kernel(
     // Temporary sum storage for batch
     for (IndexType q = 0; q < query_batch_size && query_start + q < n_queries; q++) {
         for (IndexType d = 0; d < data_batch_size && data_start + d < n_data; d++) {
+            IndexType data_index = indices[(query_start + q) * coarsed_data_cnt + data_start + d];
+            if (data_index >= tot_data) {
+                result[(query_start + q) * n_data + data_start + d] = std::numeric_limits<float>::max();
+                continue;
+            }
             ElementType sum = static_cast<ElementType>(0);
 
             for (IndexType dim = 0; dim < pq_dim; dim++) {
-                CodebookType lut_idx = codebook[dim * n_data + data_start + d];  // Column-major access
+                CodebookType lut_idx = codebook[dim * tot_data + data_index];  // Column-major access
                 sum += lut[(query_start + q) * pq_dim * n_clusters + dim * n_clusters + lut_idx];
             }
 
@@ -410,6 +476,61 @@ __global__ void process_selected_indices_kernel(const ElementType* pq_dis, Index
     if (value == std::numeric_limits<ElementType>::max()) {
         SelectedIndices[idx] = std::numeric_limits<IndexType>::max();
     }
+}
+
+__global__ void copy_coarse_filtered_indices_kernel(const uint64_t* data_ranges, 
+                                                    const uint64_t* indices, 
+                                                    uint64_t* out_list, 
+                                                    uint64_t max_cnt, uint64_t n_queries, 
+                                                    int selected_dim, int l, uint64_t n_data)
+{
+    uint64_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= n_queries || y >= max_cnt) return;
+    uint64_t left = data_ranges[selected_dim * n_queries + x];
+    uint64_t right = data_ranges[(selected_dim + l) * n_queries + x];
+
+    uint64_t cur = left + y;
+    uint64_t out_idx = x * max_cnt + y;
+    if (cur >= right) out_list[out_idx] = std::numeric_limits<uint64_t>::max();
+    else out_list[out_idx] = indices[selected_dim * n_data + cur];
+}
+
+template<typename ElementType, typename IndexType>
+__global__ void shuffle_data_kernel(const ElementType* in, ElementType* out,
+                                    IndexType n_queries, IndexType l)
+{
+    IndexType row = blockIdx.x * blockDim.x + threadIdx.x;
+    IndexType col = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (row < n_queries && col < l) {
+        ElementType lo = in[row * 2 * l + 2 * col];
+        ElementType hi = in[row * 2 * l + 2 * col + 1];
+
+        out[col * n_queries + row] = lo;
+        out[(col + l) * n_queries + row] = hi;
+    }
+}
+
+inline void copy_coarse_filtered_indices(raft::device_matrix_view<uint64_t, uint64_t> data_ranges,
+                                         raft::device_matrix_view<uint64_t, uint64_t> indices,
+                                         raft::device_matrix_view<uint64_t, uint64_t> out_list,
+                                         int selected_dim) 
+{
+    uint64_t n_queries = data_ranges.extent(0) / 2;
+    uint64_t l = data_ranges.extent(1);
+    uint64_t n_data = indices.extent(1);
+    uint64_t max_cnt = out_list.extent(1);
+
+    int full_block_per_grid_x = (n_queries + block_size_x - 1) / block_size_x;
+    int full_block_per_grid_y = (max_cnt + block_size_y - 1) / block_size_y;
+
+    dim3 full_blocks_per_grid(full_block_per_grid_x, full_block_per_grid_y);
+    dim3 full_thread_per_grid(block_size_x, block_size_y);
+
+    copy_coarse_filtered_indices_kernel<<<full_blocks_per_grid, full_thread_per_grid>>>(data_ranges.data_handle(), 
+        indices.data_handle(), out_list.data_handle(), max_cnt, n_queries, selected_dim, l, n_data);
 }
 
 inline void filter_candi_by_labels(raft::device_resources const& dev_resources,
@@ -659,6 +780,7 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
 // todo: modify it to template
 inline void calc_batched_L2_distance(raft::device_resources const& dev_resources,
                                      raft::device_matrix_view<float, uint64_t> const& queries, 
+                                     raft::device_matrix_view<uint64_t, uint64_t> const& indices,
                                      raft::device_matrix_view<uint8_t, uint64_t> const& codebook,
                                      raft::device_matrix_view<float, uint64_t> const& centers, 
                                      raft::device_matrix_view<float, uint64_t> dis,
@@ -666,11 +788,18 @@ inline void calc_batched_L2_distance(raft::device_resources const& dev_resources
                                      uint64_t pq_len,
                                      uint64_t query_batch_size = 1, 
                                      uint64_t data_batch_size = 1, 
-                                     uint64_t n_clusters = 256) 
+                                     uint64_t n_clusters = 256,
+                                     int64_t n_indices = -1) 
 {
     uint64_t n_dim = queries.extent(1);
-    uint64_t n_data = codebook.extent(1);
+    uint64_t tot_data = codebook.extent(1);
+    uint64_t n_data = tot_data;
     uint64_t n_queries = queries.extent(0);
+    uint64_t coarsed_data_cnt = indices.extent(1);
+
+    if (n_indices >= 0) {
+        n_data = n_indices;
+    }
 
     std::cout << "calc vector similarity: with data size: " << n_data 
                     << ", query cnt: " << n_queries << ", pq dimension: " << pq_dim << "\n";
@@ -702,7 +831,8 @@ inline void calc_batched_L2_distance(raft::device_resources const& dev_resources
     dim3 full_threads_per_block(block_size_x, block_size_y);
 
     compute_batched_L2_distance_kernel<<<full_blocks_per_grid, full_threads_per_block>>>(
-        codebook.data_handle(), lut, dis.data_handle(), n_data, pq_dim, n_clusters, n_queries, data_batch_size, query_batch_size
+        codebook.data_handle(), lut, indices.data_handle(), dis.data_handle(), n_data, tot_data, 
+        coarsed_data_cnt, pq_dim, n_clusters, n_queries, data_batch_size, query_batch_size
     );
     checkCUDAErrorWithLine("launch pq similarity calculation kernel failed!");
 } 
@@ -884,4 +1014,100 @@ void calc_pairwise_filter_dis(raft::device_matrix_view<float, uint64_t> const &d
 
     calculate_filter_dis_kernel<<<grid_block_size, thread_block_size>>>(filter_dis.data_handle(), 
             constrains.data_handle(), data_labels.data_handle(), l, n_queries, n_data);
+}
+
+template <typename InputType, typename OutputType, typename IndexType>
+void matrix_scan(raft::device_matrix_view<InputType, IndexType> const &in_matrix,
+                 raft::device_matrix_view<OutputType, IndexType> &out_matrix) {
+    IndexType rows = in_matrix.extent(0);
+    IndexType cols = in_matrix.extent(1);
+
+    // Ensure in_matrix and out_matrix have the same shape
+    assert(in_matrix.extent(0) == out_matrix.extent(0));
+    assert(in_matrix.extent(1) == out_matrix.extent(1));
+
+    // Launch parallel scan for each row
+    for (IndexType row = 0; row < rows; ++row) {
+        InputType *in_row_ptr = in_matrix.data_handle() + row * cols;
+        OutputType *out_row_ptr = out_matrix.data_handle() + row * cols;
+
+        thrust::inclusive_scan(thrust::device, in_row_ptr, in_row_ptr + cols, out_row_ptr);
+    }
+}
+
+uint64_t filter_valid_data(raft::device_resources const& dev_resources,
+                           raft::device_matrix_view<float, uint64_t> const &data_labels, 
+                           raft::device_matrix_view<float, uint64_t> const &constrains,
+                           raft::device_matrix_view<uint64_t, uint64_t> const &coarse_filtered_indices,
+                           raft::device_matrix_view<uint64_t, uint64_t> valid_indices)
+{
+    uint64_t n_data = data_labels.extent(0);
+    uint64_t n_coarse_filtered_indices = coarse_filtered_indices.extent(1);
+    uint64_t l = data_labels.extent(1);
+    uint64_t n_constrains = constrains.extent(0);
+
+    dim3 thread_block_size(16, 16);
+    dim3 grid_block_size((n_constrains + thread_block_size.x - 1) / thread_block_size.x, 
+                         (n_coarse_filtered_indices + thread_block_size.y - 1) / thread_block_size.y);
+
+    // Allocate memory for intermediate results
+    int* valid_flags_pool = static_cast<int*>(parafilter_mmr::mem_allocator(n_constrains * n_data * sizeof(int)));
+    uint64_t* valid_flags_prefix_sum_pool = static_cast<uint64_t*>(parafilter_mmr::mem_allocator(n_constrains * n_data * sizeof(uint64_t)));
+    auto valid_flags_view = raft::make_device_matrix_view<int, uint64_t>(valid_flags_pool, n_constrains, n_coarse_filtered_indices);
+    auto valid_flags_prefix_sum_view = raft::make_device_matrix_view<uint64_t, uint64_t>(valid_flags_prefix_sum_pool, 
+            n_constrains, n_coarse_filtered_indices);
+
+    int* valid_flags = valid_flags_view.data_handle();
+    uint64_t* valid_flags_prefix_sum = valid_flags_prefix_sum_view.data_handle();
+
+    uint64_t* row_counts = static_cast<uint64_t*>(parafilter_mmr::mem_allocator(n_constrains * sizeof(uint64_t)));
+
+    auto valid_indices_tmp_pool = 
+        static_cast<uint64_t*>(parafilter_mmr::mem_allocator(n_constrains * n_data * sizeof(uint64_t)));
+    auto valid_indices_tmp = raft::make_device_matrix_view<uint64_t, uint64_t>(valid_indices_tmp_pool, 
+        valid_indices.extent(0), valid_indices.extent(1));
+
+    // Initialize valid_indices to a very large value
+    thrust::device_ptr<uint64_t> valid_indices_ptr(valid_indices_tmp.data_handle());
+    thrust::fill(valid_indices_ptr, valid_indices_ptr + valid_indices.size(), std::numeric_limits<uint64_t>::max());
+
+    // Call mark_valid_kernel
+    mark_valid_kernel<<<grid_block_size, thread_block_size>>>(constrains.data_handle(), 
+                                                              data_labels.data_handle(), 
+                                                              l, n_constrains, n_data, valid_flags, 
+                                                              coarse_filtered_indices.data_handle(),
+                                                              n_coarse_filtered_indices);
+
+    matrix_scan<int, uint64_t, uint64_t>(valid_flags_view, valid_flags_prefix_sum_view);
+    // Call write_res_kernel
+    write_res_kernel<<<grid_block_size, thread_block_size>>>(valid_flags, 
+                                                             valid_flags_prefix_sum, 
+                                                             valid_indices_tmp.data_handle(), 
+                                                             row_counts, n_constrains, n_coarse_filtered_indices);
+    
+    // Compute the maximum value in row_counts using Thrust
+    thrust::device_ptr<uint64_t> row_counts_ptr(row_counts);
+    uint64_t max_value = thrust::reduce(row_counts_ptr, row_counts_ptr + n_constrains, 0, thrust::maximum<uint64_t>());
+    select_elements<uint64_t, uint64_t>(dev_resources, coarse_filtered_indices, valid_indices_tmp, valid_indices, false);
+
+    return max_value;
+}
+
+template<typename ElementType, typename IndexType>
+void shuffle_data(raft::device_matrix_view<ElementType, IndexType> in_mat, 
+                  raft::device_matrix_view<ElementType, IndexType> out_mat) 
+{
+    IndexType n_queries = in_mat.extent(0);
+    IndexType l = in_mat.extent(1) / 2;
+
+    dim3 block_dim(32, 8); 
+    dim3 grid_dim((n_queries + block_dim.x - 1) / block_dim.x,
+                  (l + block_dim.y - 1) / block_dim.y);
+
+    shuffle_data_kernel<<<grid_dim, block_dim>>>(
+        in_mat.data_handle(),
+        out_mat.data_handle(),
+        n_queries,
+        l
+    );
 }
