@@ -170,6 +170,118 @@ void parafilter_build(raft::device_resources const & dev_resources, // in: the r
   }
 }
 
+void parafilter_build_sorting_index(raft::device_matrix_view<float, uint64_t> const& data_labels,
+                                    raft::device_matrix_view<float, uint64_t> sorted_data_labels_view, 
+                                    raft::device_matrix_view<uint64_t, uint64_t> sorted_data_labels_idx_view)
+{
+    uint64_t l = data_labels.extent(1);
+    uint64_t n_data = data_labels.extent(0);
+
+    // Allocate memory for the transposed matrix (l x n_data)
+    float* transposed_data = static_cast<float*>(parafilter_mmr::mem_allocator(n_data * l * sizeof(float)));
+    transpose_matrix(data_labels.data_handle(), transposed_data, n_data, l);
+
+    // Allocate memory for sorted values and indices
+    float* sorted_data_device = sorted_data_labels_view.data_handle();
+    uint64_t* sorted_indices_device = sorted_data_labels_idx_view.data_handle();
+    float* data_labels_ptr = data_labels.data_handle();
+
+    for (uint64_t i = 0; i < l; i++) {
+        float* col_start = transposed_data + i * n_data;
+        uint64_t* idx_start = sorted_indices_device + i * n_data;
+        
+        // Initialize indices
+        thrust::device_ptr<uint64_t> idx_ptr(idx_start);
+        thrust::sequence(idx_ptr, idx_ptr + n_data);
+
+        // Sort values while keeping track of indices
+        thrust::sort_by_key(thrust::device, col_start, col_start + n_data, idx_start);
+        cudaMemcpy(sorted_data_device + i * n_data, col_start, sizeof(float) * n_data, cudaMemcpyDeviceToDevice);
+    }
+
+    // Allocate host memory for output
+}
+
+void find_filter_range(raft::device_matrix_view<float, uint64_t> const& ranges,
+                       raft::device_matrix_view<float, uint64_t> sorted_data_labels_view, 
+                       raft::device_matrix_view<uint64_t, uint64_t> sorted_data_labels_idx_view,
+                       raft::device_matrix_view<uint64_t, uint64_t> data_ranges_view, 
+                       raft::device_matrix_view<uint64_t, uint64_t> &coarsed_filterd_indices) 
+{
+    uint64_t n_queries = ranges.extent(0);
+    uint64_t l = ranges.extent(1) / 2;
+    uint64_t n_data = sorted_data_labels_view.extent(1);
+
+    // Allocate memory for data_ranges on the device
+    uint64_t* device_data_ranges = data_ranges_view.data_handle();
+    float* ranges_host = new float[n_queries * 2 * l];
+    uint64_t* data_ranges_host = new uint64_t[n_queries * 2 * l];
+
+    auto shuffled_ranges = parafilter_mmr::make_device_matrix_view<float, uint64_t>(2 * l, n_queries);
+    shuffle_data<float, uint64_t>(ranges, shuffled_ranges);
+    auto shuffled_ranges_ptr = shuffled_ranges.data_handle();
+
+    cudaMemcpy(ranges_host, ranges.data_handle(), n_queries * 2 * l * sizeof(float), cudaMemcpyDeviceToHost);
+    uint64_t* max_len = new uint64_t[l];
+
+    for (uint64_t i = 0; i < l; i++) {
+        float* sorted_col = sorted_data_labels_view.data_handle() + i * n_data; // Sorted values for the i-th column
+        uint64_t* sorted_idx_col = sorted_data_labels_idx_view.data_handle() + i * n_data; // Corresponding indices
+
+        thrust::device_ptr<float> lower_queries_ptr(shuffled_ranges.data_handle() + i * n_queries);
+        thrust::device_ptr<float> upper_queries_ptr(shuffled_ranges.data_handle() + (i + l) * n_queries);
+
+        thrust::device_ptr<uint64_t> lower_indices_ptr(device_data_ranges + i * n_queries);
+        thrust::device_ptr<uint64_t> upper_indices_ptr(device_data_ranges + (i + l) * n_queries);
+
+        thrust::lower_bound(
+          thrust::device,
+          sorted_col, sorted_col + n_data,
+          lower_queries_ptr, lower_queries_ptr + n_queries,
+          lower_indices_ptr
+        );
+
+        thrust::upper_bound(
+          thrust::device,
+          sorted_col, sorted_col + n_data,
+          upper_queries_ptr, upper_queries_ptr + n_queries,
+          upper_indices_ptr
+        );
+
+        thrust::host_vector<uint64_t> h_lower(lower_indices_ptr, lower_indices_ptr + n_queries);
+        thrust::host_vector<uint64_t> h_upper(upper_indices_ptr, upper_indices_ptr + n_queries);
+
+        uint64_t max_range = 0;
+        for (uint64_t j = 0; j < n_queries; j++) {
+            uint64_t lower_idx = h_lower[j];
+            uint64_t upper_idx = h_upper[j];
+            uint64_t range_len = upper_idx - lower_idx;
+
+            max_range = std::max(max_range, range_len);
+        }
+
+        max_len[i] = max_range;
+    }
+
+    uint64_t label_dim = 0;
+    uint64_t min_cnt = 1e18;
+
+    for (int i = 0; i < l; i++) {
+        if (max_len[i] < min_cnt) {
+            min_cnt = max_len[i];
+            label_dim = i;
+        }
+    }
+
+    uint64_t* coarsed_filterd_indices_pool = static_cast<uint64_t*>(parafilter_mmr::mem_allocator(n_queries * n_data * sizeof(uint64_t)));
+    coarsed_filterd_indices = raft::make_device_matrix_view<uint64_t, uint64_t>(coarsed_filterd_indices_pool, n_queries, min_cnt);
+    // Copy the data_ranges back to the device
+    copy_coarse_filtered_indices(data_ranges_view, sorted_data_labels_idx_view, coarsed_filterd_indices, label_dim);
+
+    delete[] ranges_host;
+    delete[] data_ranges_host;
+}
+
 void parafilter_query(raft::device_resources const& dev_resources,
                       raft::device_matrix_view<uint8_t, uint64_t> const& codebook,
                       raft::device_matrix_view<float, uint64_t> const& dataset,
@@ -188,7 +300,9 @@ void parafilter_query(raft::device_resources const& dev_resources,
                       int pq_dim, 
                       int pq_len, 
                       int topk, 
-                      float merge_rate) 
+                      float merge_rate, 
+                      raft::device_matrix_view<float, uint64_t> sorted_data_labels_view = {},
+                      raft::device_matrix_view<uint64_t, uint64_t> sorted_data_labels_idx_view = {}) 
 {    
   int n_data = dataset.extent(0);
   int n_queries = queries.extent(0);
@@ -232,31 +346,40 @@ void parafilter_query(raft::device_resources const& dev_resources,
   select_secondary_centers(dev_resources, cnt_matirx, cos_2_level_idx.sceondary_centers, cos_2_level_idx.inv_secondary_id_map, 
         queries, n_samples, );
 
-<<<<<<< HEAD
   auto vec_dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, n_data); 
   calc_batched_L2_distance(dev_resources, queries, codebook, pq_centers, vec_dis, pq_dim, pq_len, 1, 1, n_clusters);
-=======
+
   auto valid_indices = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, n_data);
   void* vec_dis_mem = parafilter_mmr::mem_allocator(n_queries * n_data * sizeof(float)); 
->>>>>>> Implement GPU post-filter algorithm
+
 
   uint64_t valid_cnt = filter_valid_data(data_labels, ranges, valid_indices);
+
+  auto valid_indices_pool = static_cast<uint64_t*>(parafilter_mmr::mem_allocator(n_queries * n_data * sizeof(uint64_t)));
+  void* vec_dis_mem = parafilter_mmr::mem_allocator(n_queries * n_data * sizeof(float));
+  
+  auto data_ranges_view = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(2 * n_queries, l);
+  raft::device_matrix_view<uint64_t, uint64_t> coarsed_filterd_indices{};
+  find_filter_range(ranges, sorted_data_labels_view, sorted_data_labels_idx_view, data_ranges_view, coarsed_filterd_indices);
+  uint64_t n_coarsed_filter_cnt = coarsed_filterd_indices.extent(1);
+  LOG(TRACE) << "valid index cnt after coarse filter: " << n_coarsed_filter_cnt;
+  auto valid_indices = raft::make_device_matrix_view<uint64_t, uint64_t>(valid_indices_pool, n_queries, n_coarsed_filter_cnt);
+
+  uint64_t valid_cnt = filter_valid_data(dev_resources, data_labels, ranges, coarsed_filterd_indices, valid_indices);
+
   auto vec_dis = raft::make_device_matrix_view<float, uint64_t>((float *)vec_dis_mem, n_queries, valid_cnt);
   LOG(TRACE) << "query batch maximum valid indices cnt: " << valid_cnt;
   calc_batched_L2_distance(dev_resources, queries, valid_indices, codebook, centers, vec_dis, pq_dim, pq_len, 1, 1, n_clusters, valid_cnt);
   topk = min((uint64_t)topk, valid_cnt);
 
-<<<<<<< HEAD
   // calculated distance between data lables and normalized constrains
   // raft::distance::pairwise_distance(dev_resources, 
   //        normalized_query_labels, normalized_data_labels, label_dis, metric);
-=======
   auto first_val_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(float));
   auto first_idx_indirect_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(uint64_t));
   auto first_idx_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(uint64_t));
 
   int exp_topk = min((uint64_t)topk * exps[0], valid_cnt);
->>>>>>> Implement GPU post-filter algorithm
 
   auto first_val = raft::make_device_matrix_view<float, uint64_t>((float*)first_val_mem, n_queries, exp_topk);
   auto first_idx_indirect = raft::make_device_matrix_view<uint64_t, uint64_t>((uint64_t*)first_idx_indirect_mem, n_queries, exp_topk);
@@ -346,8 +469,22 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
     auto ranges = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, 2 * l);
 
     thread_local raft::device_matrix_view<float, uint64_t> normalized_data_labels{};
+    thread_local raft::device_matrix_view<float, uint64_t> sorted_data_labels_view{};
+    thread_local raft::device_matrix_view<uint64_t, uint64_t> sorted_data_labels_idx_view{};
+
     if (is_data_changed) { 
       normalized_data_labels = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_data, l);
+      sorted_data_labels_view = parafilter_mmr::make_device_matrix_view<float, uint64_t>(l, n_data);
+      sorted_data_labels_idx_view = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(l, n_data);
+
+      parafilterPerfLogWraper(
+        parafilter_build_sorting_index(
+              data_labels, 
+              sorted_data_labels_view, 
+              sorted_data_labels_idx_view
+        ),
+              build_time
+        );
     }
 
     parafilterPerfLogWraper(
@@ -386,7 +523,9 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                      pq_dim, 
                      pq_len, 
                      topk, 
-                     merge_rate
+                     merge_rate, 
+                     sorted_data_labels_view, 
+                     sorted_data_labels_idx_view
                   ), 
                      query_time
     );

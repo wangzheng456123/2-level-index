@@ -64,7 +64,8 @@ void compute_lut_cpu(
     IndexType pq_dim,
     IndexType n_clusters,
     IndexType pq_len,
-    IndexType n_queries) {
+    IndexType n_queries) 
+{
 
     static_assert(std::is_arithmetic<ElementType>::value, "ElementType must be an arithmetic type.");
     static_assert(std::is_integral<IndexType>::value, "IndexType must be an integral type.");
@@ -80,12 +81,32 @@ void compute_lut_cpu(
             for (IndexType cluster_idx = 0; cluster_idx < n_clusters; ++cluster_idx) {
                 // Compute the squared Euclidean distance
                 ElementType distance = static_cast<ElementType>(0);
-
                 for (IndexType i = 0; i < pq_len; ++i) {
+                    /*
+                    n_clusters x pq_len
+                    +-----------------------------+
+                    | [####] [####] [####] ...   |  <- Row 1
+                    | [####] [####] [####] ...   |  <- Row 2
+                    | [####] [####] [####] ...   |  <- Row 3
+                    |  ...                       |
+                    | [####] [####] [####] ...   |  <- Row pq_dim
+                    +-----------------------------+
+                    */
                     IndexType center_idx = calculate_index(
                         {pq_idx, cluster_idx, i}, 
                         {pq_dim, n_clusters, pq_len});
 
+
+                    /*
+                    pq_dim x pq_len
+                    +-----------------------------+
+                    | [####] [####] [####] ...   |  <- Row 1
+                    | [####] [####] [####] ...   |  <- Row 2
+                    | [####] [####] [####] ...   |  <- Row 3
+                    |  ...                       |
+                    | [####] [####] [####] ...   |  <- Row n_quries
+                    +-----------------------------+
+                    */
                     IndexType query_idx_calculated = calculate_index(
                         {query_idx, pq_idx, i}, 
                         {n_queries, pq_dim, pq_len});
@@ -93,7 +114,17 @@ void compute_lut_cpu(
                     ElementType diff = centers[center_idx] - queries[query_idx_calculated];
                     distance += diff * diff;
                 }
-
+                
+                /*
+                pq_dim x pq_len
+                +-----------------------------+
+                | [####] [####] [####] ...   |  <- Row 1
+                | [####] [####] [####] ...   |  <- Row 2
+                | [####] [####] [####] ...   |  <- Row 3
+                |  ...                       |
+                | [####] [####] [####] ...   |  <- Row n_quries
+                +-----------------------------+
+                */
                 IndexType lut_idx = calculate_index(
                     {query_idx, pq_idx, cluster_idx}, 
                     {n_queries, pq_dim, n_clusters});

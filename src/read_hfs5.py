@@ -33,7 +33,8 @@ def process_key_data(f, key, dir_path: str):
         a = process_dataset(a)
         if is_label(key):
             rows_to_write = a[:100]
-            # np.savetxt(dir_path + key + ".txt", rows_to_write, delimiter=',', fmt='%.6f')
+            print(rows_to_write)
+            #np.savetxt(dir_path + key + ".txt", rows_to_write, delimiter=',', fmt='%.6f')
     else:
         fmt = '%.10f'
         if a.dtype == 'int32':
@@ -96,7 +97,7 @@ def read_hdf5(data: str = "ann"):
     for dtype in types:
         print(dtype)
 
-    #if {"neighbors", "train_label", "test_label"}.issubset(f.keys()):
+    # if {"neighbors", "train_label", "test_label"}.issubset(f.keys()):
     #    process_neighbors(f)
         
 
