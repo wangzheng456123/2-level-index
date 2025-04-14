@@ -53,7 +53,7 @@ void parafilter_build(raft::device_resources const & dev_resources, // in: the r
   uint64_t n_row = dataset.extent(0);
   uint64_t n_dim = dataset.extent(1);
 
-  LOG(INFO) << "build pq codebook with dataset size: " << n_row << ", data dimension: " << n_dim << 
+  LOG(TRACE) << "build pq codebook with dataset size: " << n_row << ", data dimension: " << n_dim << 
     ", pq dimension: " << pq_dim << ", number of cluserters: " << n_clusters << "\n";
 
   // todo: properly processing n_dim is'n multiple of pq_dim
@@ -726,6 +726,7 @@ int main(int argc, char* argv[])
   exps[1] = p_config->exp1;
   uint32_t topk = p_config->topk;
   float merge_rate = p_config->merge_rate;
+  int filter_dim = p_config->filter_dim;
 
   LOG(TRACE) << "run with config: dataset = " << dataset_path << ", pq_dim = " << pq_dim << 
              ", n_clusters = " << n_clusters << ", exps = " << exps[0]; 
@@ -798,12 +799,13 @@ int main(int argc, char* argv[])
         uint64_t cur_query_batch_size = query_batch_size;
         uint64_t cur_query_offset = query_offset + query_batch_offset;
 
-        build_dataset(keys, types, &data_map, size_map, dataset_path, data_batch_offset, cur_data_batch_size, cur_query_offset, cur_query_batch_size);
+        build_dataset(keys, types, &data_map, size_map, dataset_path, data_batch_offset, cur_data_batch_size, cur_query_offset, cur_query_batch_size, filter_dim);
         auto dataset      = raft::make_device_matrix_view<float, uint64_t>((float *)data_map["train_vec"], cur_data_batch_size, n_dim);
         auto queries      = raft::make_device_matrix_view<float, uint64_t>((float *)data_map["test_vec"], cur_query_batch_size, n_dim);
 
         auto data_labels = raft::make_device_matrix_view<float, uint64_t>((float *)data_map["train_label"], cur_data_batch_size, l);
-        auto query_labels = raft::make_device_matrix_view<float, uint64_t>((float *)data_map["test_label"], cur_query_batch_size, l);
+        raft::device_matrix_view<float, uint64_t> query_labels{};
+        query_labels = raft::make_device_matrix_view<float, uint64_t>((float *)data_map["test_label"], cur_query_batch_size, l * filter_dim);
 
         auto selected_distance = raft::make_device_matrix_view<float, uint64_t>(selected_distance_device_ptr + cur_res_buff_offset * inter_buffer_size, 
                 cur_query_batch_size, topk);

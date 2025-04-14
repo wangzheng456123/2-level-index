@@ -156,6 +156,7 @@ struct parafilter_config {
   uint64_t mem_bound;
   uint64_t is_calc_mem_predictor_coeff;
   uint64_t lowest_query_batch;
+  uint64_t filter_dim;
   float merge_rate;
 
   std::string dataset;
@@ -257,7 +258,9 @@ public:
           if (line.empty()) break;
 
           if (line.find("type=") == 0) {
-            filter_type[filter_index] = std::stoi(line.substr(5));
+            int filter = std::stoi(line.substr(5));
+            filter_type[filter_index] = filter;
+            if (filter == 3) break;
           }
           else if (line.find("shift_val=") == 0) {
             std::vector<float> interval = parse_array<float>(line.substr(10));
@@ -610,6 +613,23 @@ inline size_t get_datatype_size(std::string const& type)
 {
   if (type == "int32") return sizeof(int32_t);
   else if (type == "float32") return sizeof(float);
+  else if (type == "int64") return sizeof(int64_t);
+  else if (type == "float64") return sizeof(double);
+  else if (type == "int8") return sizeof(int8_t);
+  else if (type == "uint8") return sizeof(uint8_t);
+  else if (type == "uint16") return sizeof(uint16_t);
+  else if (type == "uint32") return sizeof(uint32_t);
+  else if (type == "uint64") return sizeof(uint64_t);
+  else if (type == "char") return sizeof(char);
+  else if (type == "bool") return sizeof(bool);
+  else if (type == "int") return sizeof(int);
+  else if (type == "long") return sizeof(long);
+  else if (type == "long long") return sizeof(long long);
+  else if (type == "unsigned int") return sizeof(unsigned int);
+  else if (type == "unsigned long") return sizeof(unsigned long);
+  else if (type == "unsigned long long") return sizeof(unsigned long long);
+  else if (type == "short") return sizeof(short);
+  else if (type == "unsigned short") return sizeof(unsigned short);
   else {
     LOG(INFO) << "data type not suported: " << type;
     exit(0);
@@ -817,7 +837,8 @@ inline void build_dataset(
     uint64_t data_offset = 0,
     uint64_t data_batch_size = 0,
     uint64_t query_offset = 0,
-    uint64_t query_batch_size = 0) 
+    uint64_t query_batch_size = 0, 
+    int filter_dim = 1) 
 {
     for (const auto& key : keys) {
 
@@ -882,6 +903,8 @@ inline void build_dataset(
 
             } else if (key.find("test") != std::string::npos) {
                 n_row = query_batch_size;
+                if (is_label) n_dim *= filter_dim; 
+
                 offset = query_offset;
 
                 if (end_in_advance(current_query_size, current_query_offset,
@@ -894,7 +917,7 @@ inline void build_dataset(
                 continue;
             }
 
-            LOG(INFO) << "build data set: " << key << " with: "
+            LOG(TRACE) << "build data set: " << key << " with: "
                       << n_row << " rows, " << n_dim << " dimensions from offset: "
                       << offset;
 
@@ -1025,4 +1048,5 @@ std::map<std::string, int> parafilter_config::str_to_offset_map = { \
       {"IS_CALC_MEM_PREDICTOR_COEFF", offsetof(parafilter_config, is_calc_mem_predictor_coeff)}, \
       {"MERGE_RATE", offsetof(parafilter_config, merge_rate)}, \
       {"LOWEST_QUERY_BATCH", offsetof(parafilter_config, lowest_query_batch)}, \
+      {"FILTER_DIM", offsetof(parafilter_config, filter_dim)}, \
 };
