@@ -163,6 +163,10 @@ __global__ void denormalize_labels_kernel(const float* data, uint64_t n_data,
             out[idx * 2] = val / div_values[i];
             out[idx * 2 + 1] = std::numeric_limits<float>::max();
         }
+        else if (map_types[i] == 3) {
+            out[2 * idx] = data[2 * idx];
+            out[2 * idx + 1] = data[2 * idx + 1];
+        }
     }
 }
 
@@ -648,13 +652,6 @@ inline void preprocessing_labels(raft::device_resources const& dev_resources,
             f_config.l                                       // Length of intervals
         );
     }
-
-    cudaDeviceSynchronize();
-
-    auto data_labels_ptr = data_labels.data_handle();
-    auto denormalized_query_labels_ptr = denormalized_query_labels.data_handle();
-    auto normalized_query_labels_ptr = normalized_query_labels.data_handle();
-    auto normalized_data_labels_ptr = normalized_data_labels.data_handle();
 }
 
 // calculate similarity between batched datas and queries
