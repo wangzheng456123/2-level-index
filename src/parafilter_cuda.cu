@@ -24,6 +24,7 @@
 #include <raft/linalg/coalesced_reduction.cuh>
 #include <raft/matrix/slice.cuh>
 #include <raft/cluster/kmeans.cuh>
+#include <raft/cluster/kmeans_balanced.cuh>
 #include <raft/cluster/kmeans_types.hpp>
 #include <raft/matrix/select_k.cuh>
 
@@ -43,15 +44,19 @@ void get_parafilter_config(parafilter_config **conf, const char path[] = "parafi
 
 void parafilter_build(raft::device_resources const & dev_resources, // in: the raft resources
                       raft::device_matrix_view<const float, uint64_t> dataset, //in: the training dataset
+                      raft::device_matrix_view<const float, uint64_t> normalized_data_labels, // normalized data label for build first level index
                       size_t pq_dim,  //in: dimesnion of the pq vector
                       size_t pq_len, 
-                      size_t n_clusters, //in: number of clusters for each subspace
+                      size_t* n_clusters, //in: number of clusters in different level index
                       raft::device_matrix_view<uint8_t, uint64_t> codebook, //out: codebook
-                      raft::device_matrix_view<float, uint64_t> centers // out: centers
+                      raft::device_matrix_view<float, uint64_t> pq_centers // out: centers
+                      cos_2_level_index_t &cos_2_level_index, //out: 2-level index
                       ) 
 {
   uint64_t n_row = dataset.extent(0);
   uint64_t n_dim = dataset.extent(1);
+
+  uint64_t l = normalized_data_labels.extent(1);
 
   LOG(TRACE) << "build pq codebook with dataset size: " << n_row << ", data dimension: " << n_dim << 
     ", pq dimension: " << pq_dim << ", number of cluserters: " << n_clusters << "\n";
@@ -59,12 +64,75 @@ void parafilter_build(raft::device_resources const & dev_resources, // in: the r
   // todo: properly processing n_dim is'n multiple of pq_dim
 
   raft::cluster::kmeans::KMeansParams params;
-  params.n_clusters = n_clusters;
+
+  params.n_clusters = n_clusters[0];
   params.tol = 1e-5;
+  params.metric = raft::distance::DistanceType::CosineExpanded;
+
+  cos_2_level_index.centers = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_clusters[0], l);
+  auto inv_list = parafilter_mmr::make_device_vector_view<uint64_t, uint64_t>(n_row);
 
   float interia;
   uint64_t niters;
+  
+  raft::cluster::kmeans::fit_predict<float, uint64_t>(
+    dev_resources, 
+    params, 
+    normalized_data_labels, 
+    std::nullopt, 
+    cos_2_level_index.centers, 
+    inv_list,
+    raft::make_host_scalar_view(&interia), 
+    raft::make_host_scalar_view(&niters));
 
+  group_by_cluster_id(dataset, inv_list, cos_2_level_index.clusters_list, n_clusters[0]);
+  params.metric = raft::distance::DistanceType::L2Expanded;
+
+  int tot_centers = 0;
+  float* secondary_centers = static_cast<float *>(parafilter_mmr::mem_allocator(n_clusters[0] * n_clusters[1] * n_dim * sizeof(float)));
+  int* inv_secondary_centers_ids = static_cast<int *>(parafilter_mmr::mem_allocator(n_clusters[0] * n_clusters[1] * n_dim * sizeof(float)));
+
+  uint64_t** secondary_clusters_ptr_host = new uint64_t*[n_clusters[0] * n_clusters[1]];
+  uint64_t* secondary_clusters_list_len_host = new uint64_t[n_clusters[0] * n_clusters[1]];
+
+  for (int i = 0; i < n_cluster; i++) {
+    params.n_clusters = min((int)n_clusters[1], cos_2_level_index.clusters_list[i].extent(0));
+    tot_centers += params.n_clusters;
+
+    auto cur_centers_view = parafilter_mmr::make_device_matrix_view<float, uint64_t>(params.n_clusters, n_dim);
+    auto cur_inv_idx_view = parafilter_mmr::make_device_vector_view<uint64_t, uint64_t>(cluster_list[i].extent(0));
+
+    raft::cluster::kmeans::fit_predict<float, uint64_t>(
+      dev_resources, 
+      params, 
+      cluster_list[i], 
+      std::nullopt, 
+      cur_centers_view, 
+      cur_inv_idx_view,
+      raft::make_host_scalar_view(&interia), 
+      raft::make_host_scalar_view(&niters));
+
+      cudaMemcpy(secondary_centers + n_dim * tot_centers, cur_centers_view.data_handle(), 
+            sizeof(float) * params.n_clusters * n_dim, cudaMemcpyDeviceToDevice);
+
+      std::vector<raft::device_vector_view<float, uint64_t>> cur_secondary_clusters_list;
+      group_by_cluster_id(cluster_list[i], cur_inv_idx_view, cur_secondary_clusters_list, params.n_clusters);
+      
+      for (int j = 0; j < cur_secondary_clusters_list.size(); j++) {
+        secondary_clusters_ptr_host[tot_centers + j] = cur_secondary_clusters_list.data_handle();
+        secondary_clusters_list_len_host[tot_centers + j] = cur_secondary_clusters_list.extent(0);
+      }
+      parafilter_fill(inv_secondary_centers_ids, i, params.n_clusters);
+  }
+  cos_2_level_index.secondary_centers_list = raft::make_device_matrix_view<float, uint64_t>(secondary_centers, tot_centers, n_dim);
+  cos_2_level_index.inv_secondary_id_map = raft::make_device_vector_view<int, uint64_t>(inv_secondary_centers_ids, tot_centers);
+
+  cos_2_level_index.secondary_clusters_ptr = parafilter_mmr::make_device_vector_view<uint64_t*, uint64_t>(tot_centers); 
+  cos_2_level_index.secondary_clusters_list_len = parafilter_mmr::make_device_vector_view<int, uint64_t>(tot_centers); 
+  cudaMemcpy(cos_2_level_index.secondary_clusters_ptr, secondary_clusters_ptr_host, sizeof(uint64_t*) * tot_centers, cudaMemcpyDeviceToHost);
+  cudaMemcpy(cos_2_level_index.secondary_clusters_list_len, secondary_clusters_list_len_host, 
+        sizeof(uint64_t*) * tot_centers, cudaMemcpyDeviceToHost);
+  
   // use 2 dimesnional matrix as the low level container
   uint64_t centers_len = n_clusters * pq_len;
   auto tmp_train = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_row, pq_len);
@@ -78,7 +146,7 @@ void parafilter_build(raft::device_resources const & dev_resources, // in: the r
     // todo: remove this copy since it is time consuming for large dataset.
     slice(dev_resources, dataset, tmp_train, coords);
 
-    auto cur_centers_view = raft::make_device_matrix_view<float, uint64_t>(centers.data_handle() + centers_len * i, n_clusters, pq_len);
+    auto cur_centers_view = raft::make_device_matrix_view<float, uint64_t>(pq_centers.data_handle() + centers_len * i, n_clusters, pq_len);
 
     raft::cluster::kmeans::fit_predict<float, uint64_t>(
                                        dev_resources, 
@@ -105,7 +173,7 @@ void parafilter_build(raft::device_resources const & dev_resources, // in: the r
 void parafilter_query(raft::device_resources const& dev_resources,
                       raft::device_matrix_view<uint8_t, uint64_t> const& codebook,
                       raft::device_matrix_view<float, uint64_t> const& dataset,
-                      raft::device_matrix_view<float, uint64_t> const& centers,
+                      raft::device_matrix_view<float, uint64_t> const& pq_centers,
                       raft::device_matrix_view<float, uint64_t> const& queries,
                       raft::device_matrix_view<float, uint64_t> const& data_labels,
                       raft::device_matrix_view<float, uint64_t> const& normalized_data_labels,
@@ -114,6 +182,8 @@ void parafilter_query(raft::device_resources const& dev_resources,
                       raft::device_matrix_view<float, uint64_t> const& ranges,
                       raft::device_matrix_view<float, uint64_t> selected_distance, 
                       raft::device_matrix_view<uint64_t, uint64_t> selected_indices,
+                      // 2-level index
+                      cos_2_level_index_t const& cos_2_level_index,
                       uint32_t* exps,
                       int pq_dim, 
                       int pq_len, 
@@ -124,17 +194,50 @@ void parafilter_query(raft::device_resources const& dev_resources,
   int n_queries = queries.extent(0);
   int n_dim = dataset.extent(1);
   int l = data_labels.extent(1);
-  int n_clusters = centers.extent(1) / pq_len;
+  int n_clusters = pq_centers.extent(1) / pq_len;
+
+  int ivf_clusters[2];
+
+  ivf_clusters[0] = cos_2_level_index.centers.extent(0);
+  for (auto center: cos_2_level_index.secondary_centers_list) {
+    ivf_clusters[1] = max(ivf_clusters[1], center.extent(0));
+  }
+  auto metric = raft::distance::DistanceType::CosineExpanded;
+
+  auto first_centers_dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, ivf_clusters[0]);
+  raft::distance::pairwise_distance(dev_resources, queries, cos_2_level_index.centers, first_centers_dis, metric);
+
+  int recip_filter_ratio = 10;
+  int n_centers_select = 2 * inv_clusters[0] / recip_filter_ratio;
+
+  auto selected_centers_dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, n_centers_select);
+  auto selected_centers_idx = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, n_centers_select);
+
+  raft::matrix::select_k<float, uint64_t>(dev_resources, first_centers_dis, std::nullopt, selected_centers_dis, selected_centers_idx);
+
+  auto cnt_matrix = parafilter_mmr::make_device_matrix_view<uint64_t, int>(n_queries, ivf_clusters[0]);
+  int n_samples = 1000;
+  select_valid_group(selected_centers_idx, cos_2_level_idx.clusters_list, ranges, data_labels, cnt_matrix);
+
+  int ivf_secondry_select = 3;
+
+  auto selected_secondary_centers_dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, ivf_secondry_select);
+  auto selected_secondary_centers_idx = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, ivf_secondry_select);
+
+  // todo: suppose 2-level indices can filter at least 95 data, is there better way?
+  auto mergerd_selected_indices = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, n_data / 20);
+  merge_selected_indices(selected_secondary_centers_idx, cos_2_level_idx.secondary_clusters_ptr, 
+          cos_2_level_idx.secondary_clusters_list_len, mergerd_selected_indices);
+
+  select_secondary_centers(dev_resources, cnt_matirx, cos_2_level_idx.sceondary_centers, cos_2_level_idx.inv_secondary_id_map, 
+        queries, n_samples, );
 
   auto vec_dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, n_data); 
-  // todo: batch size needs modification
-  calc_batched_L2_distance(dev_resources, queries, codebook, centers, vec_dis, pq_dim, pq_len, 1, 1, n_clusters);
+  calc_batched_L2_distance(dev_resources, queries, codebook, pq_centers, vec_dis, pq_dim, pq_len, 1, 1, n_clusters);
 
   auto label_dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, n_data); 
 
   // calculated distance between data lables and normalized constrains
-  auto metric = raft::distance::DistanceType::L2Expanded;
-
   // raft::distance::pairwise_distance(dev_resources, 
   //        normalized_query_labels, normalized_data_labels, label_dis, metric);
 
@@ -219,13 +322,15 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
 
     thread_local raft::device_matrix_view<uint8_t, uint64_t> codebook{};
     thread_local raft::device_matrix_view<float, uint64_t> centers{};
+
+    thead_local cos_2_level_index_t cos_2_level_index{}; 
   
     if (run_build) {
         codebook = parafilter_mmr::make_device_matrix_view<uint8_t, uint64_t>(pq_dim, n_data);
         centers = parafilter_mmr::make_device_matrix_view<float, uint64_t>(pq_dim, n_clusters * pq_len);
         
         parafilterPerfLogWraper(parafilter_build(dev_resources, dataset, pq_dim, pq_len, n_clusters, 
-                  codebook, centers), build_time);
+                  codebook, centers, cos_2_level_index), build_time);
     }
 
     bool is_data_changed = false;
@@ -269,6 +374,7 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                      ranges, 
                      selected_distance, 
                      selected_indices, 
+                     cos_2_level_index,
                      exps, 
                      pq_dim, 
                      pq_len, 

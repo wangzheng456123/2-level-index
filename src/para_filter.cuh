@@ -5,6 +5,9 @@
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_resources.hpp>
 #include <raft/matrix/select_k.cuh>
+#include <thrust/device_vector.h>
+#include <thrust/device_ptr.h>
+#include <thrust/fill.h>
 #include <assert.h>
 #include <cmath>
 
@@ -412,6 +415,19 @@ __global__ void process_selected_indices_kernel(const ElementType* pq_dis, Index
     }
 }
 
+__global__ void label_data_with_value_kernel(int* flags, int val, const uint64_t* ids, uint64_t n_data)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    if (x >= n_data) return;
+
+    if (lds[x] == val) {
+        flags[x] = 1;
+    }
+    else {
+        flags[x] = 0;
+    }
+}
+
 inline void filter_candi_by_labels(raft::device_resources const& dev_resources,
                                    raft::device_matrix_view<float, uint64_t> const& candi_labels, 
                                    raft::device_matrix_view<float, uint64_t> const& constrains, 
@@ -478,6 +494,111 @@ __global__ void modify_blocks(ElementType* d_matrix, IndexType n_queries, int to
         for (IndexType i = 0; i < topk; ++i) {
             d_matrix[block_start + i] += add_value;
         }
+    }
+}
+
+template <typename ElementType, typename IndexType>
+__global__ void select_rows_by_flag_kernel(const int* flags, const IndexType *prefix_sum, 
+                                           IndexType *selected_data, IndexType n_data) 
+{
+    IndexType x = blockIdx.x * blockDim.x + threadIdx.x;
+    if (x >= n_data) return;
+
+    if (flags[x]) {
+        IndexType loc = prefix_sum[x];
+        selected_data[loc * n_dim + i] = x;
+    }
+}
+
+void count_valid_elements_atomic_kernel(const float* filter, const float* data_labels, 
+                                        const uint64_t* indices, uint64_t l, uint64_t n_valid, 
+                                        int* count, const int* sample_ids, int n_samples)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    if (x >= n_samples) return;
+    int iidx = sample_ids[x];
+    uint64_t idx = indices[iidx];
+
+    const float* cur_label = data_labels + idx * l;
+    int valid = 1;
+    for (i = 0; i < l; i++) {
+        float li = filter[i * 2];
+        float ri = filter[i * 2 + 1];
+
+        if (cur_label[i] < li || cur_label[i] > ri) {
+            valid = 0;
+            break;
+        }
+    }
+    if (valid) {
+        atomicAdd(count, 1);
+    }
+}
+
+void __global__ select_valid_secondary_centers_dis_kernel(const int* cnt_matrix, const int* inv_secondary_id_map,
+                                                          float* dis, int n_samples, float thresh_hold, uint64_t n_queries,  
+                                                          int n_secondary_centers, int n_centers)
+{
+    uint64_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= n_queries || y >= n_secondary_centers) return; 
+
+    int cid = inv_secondary_id_map[i];
+    // a magic to indicate build process may fail
+    if (cid >= n_centers) { 
+        dis[x * n_secondary_centers + y] = 123456;
+    }
+    
+    int valid_cnt = cnt_matrix[cid];
+
+    if (static_cast<float>(valid_cnt) / n_samples >= thresh_hold)
+        dis[x * n_secondary_centers + y] = std::numeric_limits<float>::max();
+}
+
+template <typename T>
+__global__ void fill_kernel(T* data, T value, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) data[i] = value;
+}
+
+__global__ void init_rng_kernel(curandState* states, unsigned long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    curand_init(seed, idx, 0, &states[idx]);
+}
+
+__global__ void fill_random_kernel(int* out, curandState* states, int range, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        int r = curand(&states[idx]) % range;
+        out[idx] = r;
+    }
+}
+
+__global__ void merge_selected_kernel(
+    const uint64_t* selected_indices,        
+    const uint64_t** secondary_clusters_ptr,  
+    const uint64_t* secondary_clusters_len,   
+    uint64_t* merged_output,                  
+    uint64_t n_queries,
+    uint64_t n_selected,
+    uint64_t row_stride)
+{
+    uint64_t qid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (qid >= n_queries) return;
+
+    uint64_t write_offset = 0;
+    uint64_t* out_row = merged_output + qid * row_stride;
+
+    for (uint64_t i = 0; i < n_selected; ++i) {
+        uint64_t sel_idx = selected_indices[qid * n_selected + i];
+        const uint64_t* src = secondary_clusters_ptr[sel_idx];
+        uint64_t len = secondary_clusters_len[sel_idx];
+
+        for (uint64_t j = 0; j < len; ++j)
+            out_row[write_offset + j] = src[j];
+
+        write_offset += len;
     }
 }
 
@@ -884,4 +1005,152 @@ void calc_pairwise_filter_dis(raft::device_matrix_view<float, uint64_t> const &d
 
     calculate_filter_dis_kernel<<<grid_block_size, thread_block_size>>>(filter_dis.data_handle(), 
             constrains.data_handle(), data_labels.data_handle(), l, n_queries, n_data);
+}
+
+template<typename ElementType, typename IndexType>
+struct cos_2_level_index_t {
+    std::vector<raft::device_matrix_view<uint64_t, uint64_t>> clusters_list, 
+    raft::device_matrix_view<uint64_t*, uint64_t> secondary_clusters_ptr,
+    raft::device_vector_view<uint64_t, uint64_t> secondary_clusters_list_len,
+    raft::device_matrix_view<float, uint64_t> centers, 
+    raft::device_matrix_view<float, uint64_t> secondary_centers_list,
+    raft::device_vector_view<int, uint64_t> inv_secondary_id_map; 
+};
+
+void group_by_cluster_id(raft::device_matrix_view<float, uint64_t> dataset, 
+                         raft::device_vector_view<uint64_t, uint64_t> cluster_ids, 
+                         std::vector<raft::device_matrix_view<uint64_t, uint64_t>>& grouped_data) 
+{
+    uint64_t n_data = dataset.extent(0);
+    uint64_t n_dim = dataset.extent(1);
+
+    int n_clusters = grouped_data.size();
+    int* tmp_flags = parafilter::mem_allocator(n_data * sizeof(int));
+    uint64_t* prefix_sum = parafilter::mem_allocator(n_data * sizeof(uint64_t));
+
+    dim3 threads_block_size(256);
+    dim3 blocks_per_grid(n_data + threads_block_size - 1 / threads_block_size);
+
+    uint64_t tot_valid = 0;
+    for (int i = 0; i < n_clusters; i++) {
+        cudaMemset(tmp_flags, 0, n_data * sizeof(int));
+
+        label_data_with_value_kernel<<<blocks_per_grid, threads_block_size>>>(tmp_flags, i, cluster_ids.data_handle(), n_data);
+
+        thrust::device_ptr<int> thrust_flags(tmp_flags, tmp_flags + n_data);
+        thrust::device_ptr<uint64_t> thrust_prefix_sum(prefix_sum, prefix_sum + n_data);
+        thrust::inclusive_scan(thrust::device, thrust_flags, thrust_flags + n_data, thrust_prefix_sum);
+        uint64_t n_valid = thrust::reduce(thrust::device, thrust_prefix_sum, thrust_prefix_sum + n_data, 0, thrust::maximum<uint64_t>());
+        tot_valid += n_valid;
+        
+        auto cur_cluster_group = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_valid, 1);
+        select_rows_by_flag_kernel<<<blocks_per_grid, threads_block_size>>>(tmp_flags, 
+            prefix_sum, cur_cluster_group.data_handle(), n_data);
+        grouped_data.push_back(cur_cluster_group);
+    }
+}
+
+void select_valid_group(raft::device_matrix_view<uint64_t, uint64_t> const& selected_clusters, 
+                        std::vector<raft::device_vector_view<uint64_t, uint64_t>> const& clusters_list, 
+                        raft::device_matrix_view<float, uint64_t> const& ranges, 
+                        raft::device_matrix_view<float, uint64_t> const& data_labels, 
+                        int n_samples,
+                        raft::device_matrix_view<int, uint64_t>& cnt_maxtix)
+{
+    uint64_t l = data_labels.extent(1);
+    uint64_t n_data = data_labels.extent(0);
+    uint64_t n_queries = selected_clusters.extent(0);
+    uint64_t n_selected = selected_clusters.extent(1);
+    uint64_t n_centers = cnt_maxtix.extent(1);
+
+    std::vector<uint64_t> selected_cluster_host(n_queries * n_selected);
+    cudaMemcpy(selected_cluster_host.data(), selected_clusters.data_handle(), 
+        n_queries * n_selected * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+    int* sampled_ids = parafilter_mmr::mem_allocator<int>(sizeof(int) * n_sample);
+
+    int n_stream = 256;
+    cudaStream_t streams[256];
+    for (int i = 0; i < streams; i++) {
+        cudaStreamCreate(&streams[i]);
+    }
+
+    for (uint64_t i = 0; i < n_queries; i++) {
+        uint64_t *cur_id = selected_cluster_host.data() + i * n_selected;
+        for (uint64_t j = 0; j < n_selected; j++) {
+            uint64_t cluster_id = cur_id[j];
+            
+            auto cur_cluster_ids = clusters_list[cluster_id];
+            uint64_t cur_cluster_len = cur_cluster_ids.extent(0);
+            int cur_samples = std::min(n_samples, cur_cluster_len);
+
+            dim3 gridSize(256);
+            dim3 blockSize(cur_samples + full_threads_per_block.x - 1) / full_threads_per_block.x;
+
+            curandState* d_states = parafilter_mmr::mem_allocator(cur_samples * sizeof(curandState));
+            init_rng_kernel<<<gridSize, blockSize>>>(d_states, time(NULL));
+            fill_random_kernel<<<gridSize, blockSize>>>(sampled_ids, d_states, cur_cluster_len, cur_samples);
+            
+            count_valid_elements_atomic_kernel<<<full_threads_per_block, full_blocks_per_grid, 0, streams[j % n_stream]>>>(
+                ranges.data_handle() + 2 * l * i, 
+                data_labels.data_handle(), cur_cluster_ids.data_handle(), l, n_data, cnt_maxtix.data_handle() + i * n_centers + cluster_id, 
+                sampled_ids, n_samples);
+        }
+    }
+}
+
+void select_scondary_centers(raft::device_resources const& dev_resources,
+                             raft::device_matrix_view<int, uint64_t> const& cnt_matrix, 
+                             raft::device_matrix_view<float, uint64_t> const& secondary_centers,
+                             raft::device_matrix_view<int, uint64_t> const& inv_secondary_id_map, 
+                             raft::device_matrix_view<float, uint64_t> const& queries, 
+                             int n_samples, 
+                             raft::device_matrix_view<int, uint64_t> &selected_centers_id, 
+                             raft::device_matrix_view<float, uint64_t> &selected_centers_dis)
+{
+    uint64_t n_queries = queries.extent(0);
+    uint64_t n_dim = queries.extent(1);
+    uint64_t n_secondary_centers = inv_secondary_id_map.extent(0);
+
+    auto query_scondary_centers_dis = parafilter_mmr::make_device_matrix_view<float, int>(n_queries, n_secondary_centers);
+    raft::distance::pairwise_distance(dev_resources, queries, secondary_centers, query_scondary_centers_dis);
+
+    dim3 threads_per_block(16, 16);
+    dim3 blocks_per_grid((n_queries + threads_per_block.x - 1) / threads_per_block.x, 
+            (n_secondary_centers + threads_per_block.y - 1) / threads_per_block.y);
+
+    select_valid_secondary_centers_dis_kernel<<<blocks_per_grid, threads_per_block>>>(cnt_matrix.data_handle(), 
+        inv_secondary_id_map.data_handle(), query_scondary_centers_dis.data_handle(), n_samples, 0.5, n_queries, n_secondary_centers, n_dim);
+
+    raft::matrix_select_k<float, uint64_t>(dev_resources, query_scondary_centers_dis, std::nullopt, selected_centers_dis, selected_centers_id, true);
+}
+
+template<typename ElementType, typename IndexType>
+void parafilter_fill(ElementType* array,
+                     ElementType value, 
+                     IndexType* size)
+{
+    fill_kernel<<<(size + 255) / 256, 256>>>(array, value, size);
+}
+
+void merge_selected_indices(
+    raft::device_matrix_view<uint64_t, uint64_t> const& selected_indices,
+    raft::device_vector_view<uint64_t*, uint64_t> const& secondary_clusters_ptr,
+    raft::device_vector_view<uint64_t, uint64_t> const& secondary_clusters_list_len,
+    raft::device_matrix_view<uint64_t, uint64_t>& merged_indices)
+{
+    uint64_t n_queries = selected_indices.extent(0);
+    uint64_t n_selected = selected_indices.extent(1);
+    uint64_t row_stride = merged_indices.extent(1);  
+    int block = 256;
+    int grid = (n_queries + block - 1) / block;
+
+    merge_selected_kernel<<<grid, block>>>(
+        selected_indices.data_handle(),
+        secondary_clusters_ptr.data_handle(),
+        secondary_clusters_list_len.data_handle(),
+        merged_indices.data_handle(),
+        n_queries,
+        n_selected,
+        row_stride);
 }
