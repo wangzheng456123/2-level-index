@@ -9,6 +9,7 @@
 #include <thrust/scan.h>
 #include <thrust/execution_policy.h>
 #include <assert.h>
+#include <bitset>
 #include <cmath>
 
 const int block_size = 128;
@@ -998,22 +999,24 @@ uint64_t filter_valid_data(raft::device_matrix_view<float, uint64_t> const &data
                                                               data_labels.data_handle(), 
                                                               l, n_constrains, n_data, valid_flags);
 
-
-    auto valid_flags_view = 
-            raft::make_device_matrix_view<int, uint64_t>(valid_flags, n_constrains, n_data);
-    auto valid_flags_prefix_sum_view = 
-            raft::make_device_matrix_view<uint64_t, uint64_t>(valid_flags_prefix_sum, n_constrains, n_data);
-
-    matrix_scan<int, uint64_t, uint64_t>(valid_flags_view, valid_flags_prefix_sum_view);
-    // Call write_res_kernel
-    write_res_kernel<<<grid_block_size, thread_block_size>>>(valid_flags, 
-                                                             valid_flags_prefix_sum, 
-                                                             valid_indices.data_handle(), 
-                                                             row_counts, n_constrains, n_data);
     
-    // Compute the maximum value in row_counts using Thrust
-    thrust::device_ptr<uint64_t> row_counts_ptr(row_counts);
-    uint64_t max_value = thrust::reduce(row_counts_ptr, row_counts_ptr + n_constrains, 0, thrust::maximum<uint64_t>());
+    int* valid_flags_host = new int[n_constrains * n_data];
+    std::vector<char> valid_flags_comperssed(n_constrains * n_data);
 
-    return max_value;
+    cudaMemcpy(valid_flags_host, valid_flags, n_constrains * n_data * sizeof(int), cudaMemcpyDeviceToHost);
+    for (uint64_t i = 0; i < n_constrains * n_data; i++)
+        valid_flags_comperssed[i] = valid_flags_host[i];
+
+    std::string flag_path = "res/valid_flags";
+    uint64_t compressed_data_size = n_constrains * n_data;
+    
+    /*
+    auto filter_map_write_future = 
+            write_binary_file_async(flag_path, 0, reinterpret_cast<void*>(valid_flags_comperssed.data()), compressed_data_size);
+    bool res = filter_map_write_future.get();
+    if (!res) {
+        throw std::runtime_error("failed to write valid res");
+    }*/
+
+    return;
 }

@@ -36,6 +36,23 @@ inline void checkCUDAError(const char *msg, int line = -1) {
   }
 }
 
+inline void export_fvecs_file(float* data, uint64_t n_data, uint64_t n_dim, const char file_name[])  
+{
+    std::ofstream out(file_name, std::ios::binary | std::ios::app);
+    if (!out) {
+        throw std::runtime_error("Failed to open output file.");
+    }
+
+    for (uint64_t i = 0; i < n_data; ++i) {
+        int32_t dim = static_cast<int32_t>(n_dim);
+        out.write(reinterpret_cast<const char*>(&dim), sizeof(int32_t));
+
+        out.write(reinterpret_cast<const char*>(data + i * n_dim), sizeof(float) * n_dim);
+    }
+
+    out.close();
+}
+
 inline void get_current_device_mem_info(uint64_t &available, uint64_t &total) {
   int id;
   cudaGetDevice(&id);
@@ -925,6 +942,11 @@ inline void build_dataset(
             uint64_t read_size = n_row * n_dim * element_size;
             std::string data_path = dir + key;
             void* data = read_binary_file(data_path, offset * n_dim * element_size, read_size);
+
+            std::string fvecs = "fvecs_data/" + key + ".fvecs";
+            
+            export_fvecs_file(static_cast<float*>(data), n_row, n_dim, fvecs.c_str());
+            
             if (!data) continue;
 
             void* device_data;

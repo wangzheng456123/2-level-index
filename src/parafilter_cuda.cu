@@ -130,35 +130,6 @@ void parafilter_query(raft::device_resources const& dev_resources,
   void* vec_dis_mem = parafilter_mmr::mem_allocator(n_queries * n_data * sizeof(float)); 
 
   uint64_t valid_cnt = filter_valid_data(data_labels, ranges, valid_indices);
-  auto vec_dis = raft::make_device_matrix_view<float, uint64_t>((float *)vec_dis_mem, n_queries, valid_cnt);
-  LOG(TRACE) << "query batch maximum valid indices cnt: " << valid_cnt;
-  calc_batched_L2_distance(dev_resources, queries, valid_indices, codebook, centers, vec_dis, pq_dim, pq_len, 1, 1, n_clusters, valid_cnt);
-  topk = min((uint64_t)topk, valid_cnt);
-
-  auto first_val_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(float));
-  auto first_idx_indirect_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(uint64_t));
-  auto first_idx_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(uint64_t));
-
-  int exp_topk = min((uint64_t)topk * exps[0], valid_cnt);
-
-  auto first_val = raft::make_device_matrix_view<float, uint64_t>((float*)first_val_mem, n_queries, exp_topk);
-  auto first_idx_indirect = raft::make_device_matrix_view<uint64_t, uint64_t>((uint64_t*)first_idx_indirect_mem, n_queries, exp_topk);
-  auto first_idx = raft::make_device_matrix_view<uint64_t, uint64_t>((uint64_t*)first_idx_mem, n_queries, exp_topk);
-
-  raft::matrix::select_k<float, uint64_t>(dev_resources, vec_dis, std::nullopt, first_val, first_idx_indirect, true, true);
-  auto valid_indices_data = valid_indices.data_handle();
-  auto first_idx_indirect_data = first_idx_indirect.data_handle();
-  
-  select_elements<uint64_t, uint64_t>(dev_resources, valid_indices, first_idx_indirect, first_idx, false);
-  auto first_idx_data = first_idx.data_handle();
-
-  refine<float, uint64_t>(
-         dev_resources, 
-         dataset,
-         queries,  
-         first_idx, 
-         selected_indices,
-         selected_distance);
 } 
 
 // todo: can this abstraction encapsulation a class?
@@ -202,7 +173,8 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                           const filter_config &f_config, 
                           float merge_rate = 0.035, 
                           bool run_build = true, 
-                          bool reconfig = false) 
+                          bool reconfig = false 
+                          ) 
 {
     size_t n_data = dataset.extent(0);
     size_t n_queries = queries.extent(0);
@@ -217,8 +189,8 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
         codebook = parafilter_mmr::make_device_matrix_view<uint8_t, uint64_t>(pq_dim, n_data);
         centers = parafilter_mmr::make_device_matrix_view<float, uint64_t>(pq_dim, n_clusters * pq_len);
         
-        parafilterPerfLogWraper(parafilter_build(dev_resources, dataset, pq_dim, pq_len, n_clusters, 
-                  codebook, centers), build_time);
+        // parafilterPerfLogWraper(parafilter_build(dev_resources, dataset, pq_dim, pq_len, n_clusters, 
+        //          codebook, centers), build_time);
     }
 
     bool is_data_changed = false;
@@ -248,6 +220,11 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
                 ), 
                     query_time
     );
+
+    float* ranges_host = new float[n_queries * 2 * l];
+    cudaMemcpy(ranges_host, ranges.data_handle(), n_queries * 2 * l * sizeof(float), cudaMemcpyDeviceToHost);
+    std::string filter_file_path = "fvecs_data/filter.fvecs";
+    export_fvecs_file(ranges_host, n_queries, 2 * l, filter_file_path.c_str());
 
     parafilterPerfLogWraper(
               parafilter_query(dev_resources, 
@@ -784,6 +761,8 @@ int main(int argc, char* argv[])
     }
     std::map<std::string, void*> data_map;
     int cur_res_buff_offset = 0;
+    data_batch_size = tot_samples;
+    query_batch_size = n_queries;
     for (uint64_t data_batch_offset = 0; data_batch_offset < tot_samples; data_batch_offset += data_batch_size) {
       uint64_t cur_data_batch_size;
       cur_data_batch_size = data_batch_size;
