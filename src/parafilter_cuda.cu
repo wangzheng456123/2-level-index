@@ -42,7 +42,7 @@ void get_parafilter_config(parafilter_config **conf, const char path[] = "parafi
   *conf = new parafilter_config(path);
 }
 
-void parafilter_build(raft::device_resources const & dev_resources, // in: the raft resources
+void parafilter_build_pq(raft::device_resources const & dev_resources, // in: the raft resources
                       raft::device_matrix_view<const float, uint64_t> dataset, //in: the training dataset
                       raft::device_matrix_view<const float, uint64_t> normalized_data_labels, // normalized data label for build first level index
                       size_t pq_dim,  //in: dimesnion of the pq vector
@@ -282,7 +282,64 @@ void find_filter_range(raft::device_matrix_view<float, uint64_t> const& ranges,
     delete[] data_ranges_host;
 }
 
-void parafilter_query(raft::device_resources const& dev_resources,
+void parafilter_query_pq_with_refine(
+    raft::device_resources const& dev_resources,
+    raft::device_matrix_view<uint8_t, uint64_t> const& codebook,
+    raft::device_matrix_view<float, uint64_t> const& dataset,
+    raft::device_matrix_view<float, uint64_t> const& centers,
+    raft::device_matrix_view<float, uint64_t> const& queries,
+    uint32_t* exps, 
+    int pq_dim, 
+    int pq_len, 
+    int topk, 
+    float merge_rate,
+    raft::device_matrix_view<float, uint64_t> selected_distance, 
+    raft::device_matrix_view<uint64_t, uint64_t> selected_indices,
+    raft::device_matrix_view<uint64_t, uint64_t> const& valid_indices,
+    uint64_t valid_cnt
+    )
+{
+  LOG(TRACE) << "query batch maximum valid indices cnt: " << valid_cnt;
+
+  int n_data = dataset.extent(0);
+  int n_queries = queries.extent(0);
+  int n_dim = dataset.extent(1);
+  int n_clusters = centers.extent(1) / pq_len;
+
+  void* vec_dis_mem = parafilter_mmr::mem_allocator(n_queries * n_data * sizeof(float));
+  auto vec_dis = raft::make_device_matrix_view<float, uint64_t>((float *)vec_dis_mem, n_queries, valid_cnt);
+
+  calc_batched_L2_distance(dev_resources, queries, valid_indices, codebook, centers, vec_dis, pq_dim, pq_len, 1, 1, n_clusters, valid_cnt);
+  topk = min((uint64_t)topk, valid_cnt);
+
+  auto first_val_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(float));
+  auto first_idx_indirect_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(uint64_t));
+  auto first_idx_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(uint64_t));
+
+  int exp_topk = min((uint64_t)topk * exps[0], valid_cnt);
+
+  auto first_val = raft::make_device_matrix_view<float, uint64_t>((float*)first_val_mem, n_queries, exp_topk);
+  auto first_idx_indirect = raft::make_device_matrix_view<uint64_t, uint64_t>((uint64_t*)first_idx_indirect_mem, n_queries, exp_topk);
+  auto first_idx = raft::make_device_matrix_view<uint64_t, uint64_t>((uint64_t*)first_idx_mem, n_queries, exp_topk);
+
+  raft::matrix::select_k<float, uint64_t>(dev_resources, vec_dis, std::nullopt, first_val, first_idx_indirect, true, true);
+  auto valid_indices_data = valid_indices.data_handle();
+  auto first_idx_indirect_data = first_idx_indirect.data_handle();
+  
+  select_elements<uint64_t, uint64_t>(dev_resources, valid_indices, first_idx_indirect, first_idx, false);
+  auto first_idx_data = first_idx.data_handle();
+
+  refine<float, uint64_t>(
+         dev_resources, 
+         dataset,
+         queries,  
+         first_idx, 
+         selected_indices,
+         selected_distance);
+}
+
+void parafilter_query_sorting_index(
+                      raft::device_resources const& dev_resources,
                       raft::device_matrix_view<uint8_t, uint64_t> const& codebook,
                       raft::device_matrix_view<float, uint64_t> const& dataset,
                       raft::device_matrix_view<float, uint64_t> const& pq_centers,
@@ -302,7 +359,8 @@ void parafilter_query(raft::device_resources const& dev_resources,
                       int topk, 
                       float merge_rate, 
                       raft::device_matrix_view<float, uint64_t> sorted_data_labels_view = {},
-                      raft::device_matrix_view<uint64_t, uint64_t> sorted_data_labels_idx_view = {}) 
+                      raft::device_matrix_view<uint64_t, uint64_t> sorted_data_labels_idx_view = {}
+                      ) 
 {    
   int n_data = dataset.extent(0);
   int n_queries = queries.extent(0);
@@ -356,7 +414,6 @@ void parafilter_query(raft::device_resources const& dev_resources,
   uint64_t valid_cnt = filter_valid_data(data_labels, ranges, valid_indices);
 
   auto valid_indices_pool = static_cast<uint64_t*>(parafilter_mmr::mem_allocator(n_queries * n_data * sizeof(uint64_t)));
-  void* vec_dis_mem = parafilter_mmr::mem_allocator(n_queries * n_data * sizeof(float));
   
   auto data_ranges_view = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(2 * n_queries, l);
   raft::device_matrix_view<uint64_t, uint64_t> coarsed_filterd_indices{};
@@ -367,38 +424,22 @@ void parafilter_query(raft::device_resources const& dev_resources,
 
   uint64_t valid_cnt = filter_valid_data(dev_resources, data_labels, ranges, coarsed_filterd_indices, valid_indices);
 
-  auto vec_dis = raft::make_device_matrix_view<float, uint64_t>((float *)vec_dis_mem, n_queries, valid_cnt);
-  LOG(TRACE) << "query batch maximum valid indices cnt: " << valid_cnt;
-  calc_batched_L2_distance(dev_resources, queries, valid_indices, codebook, centers, vec_dis, pq_dim, pq_len, 1, 1, n_clusters, valid_cnt);
-  topk = min((uint64_t)topk, valid_cnt);
-
-  // calculated distance between data lables and normalized constrains
-  // raft::distance::pairwise_distance(dev_resources, 
-  //        normalized_query_labels, normalized_data_labels, label_dis, metric);
-  auto first_val_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(float));
-  auto first_idx_indirect_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(uint64_t));
-  auto first_idx_mem = parafilter_mmr::mem_allocator(n_queries * topk * exps[0] * sizeof(uint64_t));
-
-  int exp_topk = min((uint64_t)topk * exps[0], valid_cnt);
-
-  auto first_val = raft::make_device_matrix_view<float, uint64_t>((float*)first_val_mem, n_queries, exp_topk);
-  auto first_idx_indirect = raft::make_device_matrix_view<uint64_t, uint64_t>((uint64_t*)first_idx_indirect_mem, n_queries, exp_topk);
-  auto first_idx = raft::make_device_matrix_view<uint64_t, uint64_t>((uint64_t*)first_idx_mem, n_queries, exp_topk);
-
-  raft::matrix::select_k<float, uint64_t>(dev_resources, vec_dis, std::nullopt, first_val, first_idx_indirect, true, true);
-  auto valid_indices_data = valid_indices.data_handle();
-  auto first_idx_indirect_data = first_idx_indirect.data_handle();
-  
-  select_elements<uint64_t, uint64_t>(dev_resources, valid_indices, first_idx_indirect, first_idx, false);
-  auto first_idx_data = first_idx.data_handle();
-
-  refine<float, uint64_t>(
-         dev_resources, 
-         dataset,
-         queries,  
-         first_idx, 
-         selected_indices,
-         selected_distance);
+  parafilter_query_pq_with_refine(
+    dev_resources,
+    codebook, 
+    dataset,
+    centers, 
+    queries, 
+    exps, 
+    pq_len, 
+    pq_dim, 
+    topk, 
+    merge_rate,
+    selected_distance, 
+    selected_indices, 
+    valid_indices, 
+    valid_cnt
+  );
 } 
 
 // todo: can this abstraction encapsulation a class?
@@ -459,8 +500,8 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
         codebook = parafilter_mmr::make_device_matrix_view<uint8_t, uint64_t>(pq_dim, n_data);
         centers = parafilter_mmr::make_device_matrix_view<float, uint64_t>(pq_dim, n_clusters * pq_len);
         
-        parafilterPerfLogWraper(parafilter_build(dev_resources, dataset, pq_dim, pq_len, n_clusters, 
-                  codebook, centers, cos_2_level_index), build_time);
+        parafilterPerfLogWraper(parafilter_build_pq(dev_resources, dataset, pq_dim, pq_len, n_clusters, 
+                  codebook, centers), build_time);
     }
 
     bool is_data_changed = false;
@@ -506,7 +547,7 @@ void parafilter_build_run(raft::device_resources const& dev_resources,
     );
 
     parafilterPerfLogWraper(
-              parafilter_query(dev_resources, 
+              parafilter_query_sorting_index(dev_resources, 
                      codebook, 
                      dataset, 
                      centers, 
