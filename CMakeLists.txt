@@ -34,8 +34,16 @@ rapids_cpm_init()
 include(cmake/thirdparty/get_raft.cmake)
 
 # -------------- compile tasks ----------------- #
+file(GLOB_RECURSE INDEX "src/index/*.cu")
+file(GLOB_RECURSE CORE "src/core/*.cu")
+file(GLOB_RECURSE SEARCH-ENGINE "src/search-engine/*.cu")
+file(GLOB_RECURSE UTILS "src/utils/*.cu")
+file(GLOB_RECURSE INDEX_SECONDARY "src/index/2-level_index/*.cu")
+
 add_library(easylogging src/easylogging++.cc)
 target_compile_definitions(easylogging PUBLIC ELPP_THREAD_SAFE)
 
-add_executable(parafilter src/parafilter_cuda.cu)
-target_link_libraries(parafilter PRIVATE raft::raft raft::compiled easylogging)
+add_executable(search-engine src/auto-batch-search-main.cu ${INDEX} ${CORE} ${SEARCH-ENGINE} ${UTILS} ${INDEX_SECONDARY})
+target_include_directories(search-engine PRIVATE src)
+target_link_libraries(search-engine PRIVATE raft::raft raft::compiled easylogging)
+
