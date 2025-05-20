@@ -413,5 +413,6 @@ void auto_batch_search::split_task(
     // todo: when cannot find proper batch size for current upper bound, enlarge it
     bisearch_proper_split(upper_bound);
     while (n_queries % query_batch_size != 0) query_batch_size--;
+    query_batch_size = 125;
     data_batch_size = findMaxFactor(data_batch_size, n_data);
 }

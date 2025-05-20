@@ -16,27 +16,57 @@ namespace X_IVF_PQ {
         const uint64_t* selected_indices,        
         uint64_t *const* secondary_clusters_ptr,  
         const uint64_t* secondary_clusters_len,   
+        const uint64_t* row_offset,
         uint64_t* merged_output,                  
         uint64_t n_queries,
         uint64_t n_selected,
         uint64_t row_stride)
     {
         uint64_t qid = blockIdx.x * blockDim.x + threadIdx.x;
+        uint64_t col = blockIdx.y * blockDim.y + threadIdx.y;
+        if (qid >= n_queries || col >= row_stride) return;
+    
+        uint64_t* out_row = merged_output + qid * row_stride;
+        uint64_t center_idx = 0;
+    
+        for (uint64_t i = n_selected - 1; i >= 0; --i) {
+            if (col >= row_offset[qid * n_selected + i]) {
+                center_idx = i;
+                break;
+            }
+        }
+        uint64_t cur_offset = row_offset[qid * n_selected + center_idx];
+
+        uint64_t sel_idx = selected_indices[qid * n_selected + center_idx];
+
+        const uint64_t* src = secondary_clusters_ptr[sel_idx];
+        uint64_t len = secondary_clusters_len[sel_idx];
+
+        if (col - cur_offset < len)
+            out_row[col] = src[col - cur_offset];
+        else out_row[col] = std::numeric_limits<uint64_t>::max();
+    }
+
+    __global__ void calc_indices_size_kernel(
+        const uint64_t* selected_indices,        
+        const uint64_t* secondary_clusters_len,   
+        uint64_t* row_size,    
+        uint64_t* row_offset,              
+        uint64_t n_queries,
+        uint64_t n_selected
+    )
+    {
+        uint64_t qid = blockIdx.x * blockDim.x + threadIdx.x;
         if (qid >= n_queries) return;
     
-        uint64_t write_offset = 0;
-        uint64_t* out_row = merged_output + qid * row_stride;
-    
+        uint64_t tot_len = 0;
         for (uint64_t i = 0; i < n_selected; ++i) {
             uint64_t sel_idx = selected_indices[qid * n_selected + i];
-            const uint64_t* src = secondary_clusters_ptr[sel_idx];
             uint64_t len = secondary_clusters_len[sel_idx];
-    
-            for (uint64_t j = 0; j < len; ++j)
-                out_row[write_offset + j] = src[j];
-    
-            write_offset += len;
+            row_offset[qid * n_selected + i] = tot_len;
+            tot_len += len;
         }
+        row_size[qid] = tot_len;
     }
 
     void merge_selected_indices(
@@ -47,14 +77,36 @@ namespace X_IVF_PQ {
     {
         uint64_t n_queries = selected_indices.extent(0);
         uint64_t n_selected = selected_indices.extent(1);
-        uint64_t row_stride = merged_indices.extent(1);  
+        
         int block = 256;
         int grid = (n_queries + block - 1) / block;
+
+        auto row_len = parafilter_mmr::make_device_vector_view<uint64_t, uint64_t>(n_queries);
+        auto row_offset = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, n_selected);
+        calc_indices_size_kernel<<<grid, block>>>(
+            selected_indices.data_handle(), 
+            secondary_clusters_list_len.data_handle(), 
+            row_len.data_handle(), 
+            row_offset.data_handle(), 
+            n_queries,
+            n_selected
+        );
+
+        uint64_t max_len = thrust::reduce(thrust::device, row_len.data_handle(), row_len.data_handle() + n_queries, 
+                static_cast<uint64_t>(0), thrust::maximum<uint64_t>());
+        merged_indices = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, max_len);
+        cudaMemset(merged_indices.data_handle(), 0x3f, n_queries * max_len * sizeof(uint64_t));
+        uint64_t row_stride = merged_indices.extent(1);  
+
+        dim3 block_dim(8, 32);
+        dim3 grid_dim((n_queries + block_dim.x - 1) / block_dim.x, 
+            (max_len + block_dim.y - 1) / block_dim.y);
     
-        merge_selected_kernel<<<grid, block>>>(
+        merge_selected_kernel<<<grid_dim, block_dim>>>(
             selected_indices.data_handle(),
             secondary_clusters_ptr.data_handle(),
             secondary_clusters_list_len.data_handle(),
+            row_offset.data_handle(), 
             merged_indices.data_handle(),
             n_queries,
             n_selected,
@@ -82,6 +134,57 @@ namespace X_IVF_PQ {
 
         if (!is_valid)
             dis[x * n_secondary_centers + y] = std::numeric_limits<float>::max();
+    }
+
+    static void __global__ pairwise_distance_with_map_kernel(
+        const float* mat1, const float* mat2, const int* cnt_matrix, 
+        const uint64_t* inv_secondary_id_map, float* dis, 
+        uint64_t row1, uint64_t row2, uint64_t dim, uint64_t cnt_matrix_dim
+    )
+    {
+        uint64_t x = blockIdx.x * blockDim.x + threadIdx.x;
+        uint64_t y = blockIdx.y * blockDim.y + threadIdx.y;
+
+        int cid = inv_secondary_id_map[y];
+        if (cid >= row2) { 
+            dis[x * row2 + y] = 123456;
+        }
+        
+        int is_valid = cnt_matrix[x * cnt_matrix_dim + cid];
+
+        if (!is_valid)
+            dis[x * row2 + y] = std::numeric_limits<float>::max();
+        else {
+            dis[x * row2 + y] = 0;
+            for (uint64_t i = 0; i < dim; i++)
+                dis[x * row2 + y] += pow(mat1[x * dim + i] - mat1[y * dim + i], 2);
+        }
+    }
+
+    static void pairwise_distance_with_map(
+        raft::device_matrix_view<float, uint64_t> const& mat1, 
+        raft::device_matrix_view<float, uint64_t> const& mat2,
+        raft::device_matrix_view<int, uint64_t> const& cnt_matrix, 
+        raft::device_matrix_view<uint64_t, uint64_t> const& inv_secondary_id_map,
+        raft::device_matrix_view<float, uint64_t> &out 
+    )
+    {
+        assert(mat1.extent(1) == mat2.extent(1));
+        uint64_t row1 = mat1.extent(0);
+        uint64_t row2 = mat2.extent(0);
+        uint64_t dim = mat1.extent(1); 
+        uint64_t cnt_matrix_dim = cnt_matrix.extent(1);
+
+        dim3 threads_per_block(16, 16);
+        dim3 blocks_per_grid((row1 + threads_per_block.x - 1) / threads_per_block.x, 
+                (row2 + threads_per_block.y - 1) / threads_per_block.y);
+
+        
+        pairwise_distance_with_map_kernel<<<threads_per_block, blocks_per_grid>>>(
+            mat1.data_handle(), mat2.data_handle(), cnt_matrix.data_handle(), 
+            inv_secondary_id_map.data_handle(), out.data_handle(), row1, row2, 
+            dim, cnt_matrix_dim
+        );
     }
 
     static void select_secondary_centers(
@@ -170,8 +273,11 @@ namespace X_IVF_PQ {
         uint64_t n_data = filters_and_labels.data_labels.extent(0);
         uint64_t n_queries = query_in.queries.extent(0);
         uint64_t tot_clusters = second_level_index.inv_secondary_id_map.extent(0);
-        uint64_t max_cluster_len = secondary_index_data.second_level_index.max_cluster_len;
-        uint64_t ivf_secondary_select = indices.extent(1) / max_cluster_len;
+        
+        uint64_t estimated_filter_ratio = estimate_filter_ratio(query_in);
+        uint64_t n_candi = topk * estimated_filter_ratio;
+        uint64_t n_list = secondary_config.n_list;
+        uint64_t ivf_secondary_select = n_list * ((n_candi * tot_clusters + n_data - 1) / n_data);
 
         auto selected_secondary_centers_dis = parafilter_mmr::make_device_matrix_view<float, uint64_t>(n_queries, ivf_secondary_select);
         auto selected_secondary_centers_idx = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, ivf_secondary_select);
@@ -179,8 +285,7 @@ namespace X_IVF_PQ {
         select_secondary_centers(query_in.dev_resources, bitmap_matrix, second_level_index.secondary_centers_list, 
             second_level_index.inv_secondary_id_map, 
             query_in.queries, selected_secondary_centers_idx, selected_secondary_centers_dis);
-
-        // todo: suppose 2-level indices can filter at least 95 data, is there better way?
+        
         merge_selected_indices(selected_secondary_centers_idx, second_level_index.secondary_clusters_ptr, 
                 second_level_index.secondary_clusters_list_len, indices);
     }
@@ -198,18 +303,11 @@ namespace X_IVF_PQ {
         uint64_t n_queries = in.queries.extent(0);
         uint64_t tot_sets = secondary_index_data.first_level_index.clusters_list.size();
         auto bitmap_matrix = parafilter_mmr::make_device_matrix_view<int, uint64_t>(n_queries, tot_sets);
-        uint64_t max_cluster_len = secondary_index_data.second_level_index.max_cluster_len;
         uint64_t n_data = filters_and_labels.data_labels.extent(0);
 
         select_first_level_sets(in, bitmap_matrix);
-
-        uint64_t estimated_filter_ratio = estimate_filter_ratio(in);
-        uint64_t n_candi = topk * estimated_filter_ratio;
-        uint64_t n_list = secondary_config.n_list;
-        uint64_t ivf_secondary_select = n_list * ((n_candi * tot_sets + n_data - 1) / n_data);
-
-        auto indices = parafilter_mmr::make_device_matrix_view<uint64_t, uint64_t>(n_queries, ivf_secondary_select * max_cluster_len);
-        cudaMemset(indices.data_handle(), 0x3f, ivf_secondary_select * max_cluster_len * n_queries * sizeof(uint64_t));
+        
+        raft::device_matrix_view<uint64_t, uint64_t> indices{};
         select_indices(in, bitmap_matrix, indices);
         
         valid_indices_t candidate_indices{}; 

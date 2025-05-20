@@ -71,8 +71,8 @@ namespace Grid_IVF_PQ {
                 ranges_len = f_config.shift_val[2 * i + 1] + f_config.shift_val[2 * i];
             else if (type == 1) {
                 std::vector<int> &cur_map = f_config.interval_map[i];
+                ranges_len = 0;
                 for (int j = 0; j < cur_map.size() / 2; j++) {
-                    ranges_len = 0;
                     ranges_len = max(ranges_len, abs(float(cur_map[2 * j + 1] - cur_map[2 * j])));
                 }
             }
@@ -86,14 +86,14 @@ namespace Grid_IVF_PQ {
                 uint64_t overlape = max_grids_cnt >= 2 ? 2 : 1;
                 estimated_filter_ratio *= (grid_info_host[i].end - grid_info_host[i].start) * overlape / 
                     (ranges_len * int(max_grids_cnt));
-                grid_info_host[i].cnt = max_grids_cnt;
-                grid_info_host[i].len = (global_max[i] - global_min[i]) / max_grids_cnt;
+                grid_info_host[i].cnt = max_grids_cnt > 1 ? max_grids_cnt + 1 : 1;
+                grid_info_host[i].len = (global_max[i] - global_min[i]) / grid_info_host[i].cnt;
                 max_grids_cnt = 1;
             }
             else {
                 estimated_filter_ratio *= 2.2;
                 grid_info_host[i].cnt = cnt;
-                grid_info_host[i].len = ranges_len;
+                grid_info_host[i].len = (global_max[i] - global_min[i]) / cnt;
                 max_grids_cnt /= cnt;
             }
         }
