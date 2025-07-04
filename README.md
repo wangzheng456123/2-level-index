@@ -81,3 +81,31 @@ Parafilter supports three types of filters:
 
 4. ##### calculate coeficients :
 Set is_calc_mem_predictor_coeff to 1 and run parafilter. After that, set it back to 0 to begin the actual ANN search.
+
+# Run
+
+## 1. After building
+
+Change directory to the build folder:
+
+```bash
+cd build
+```
+
+## 2. Run the binary
+
+Run the `search-engine` executable with the following command line arguments:
+
+```bash
+./search-engine [Algorithm] [path-to-APP-config-file] [path-to-filter-config-file]
+```
+
+- **[Algorithm]**: Name of the algorithm, e.g., `parafilter`
+- **[path-to-APP-config-file]**: Path to the application config file, e.g., `parafilter.conf`
+- **[path-to-filter-config-file]**: Path to the filter config file, e.g., `cc_news.conf`
+
+## 3. Example
+
+```bash
+./search-engine parafilter parafilter.conf cc_news.conf
+```
